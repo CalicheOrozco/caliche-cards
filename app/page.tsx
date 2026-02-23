@@ -383,6 +383,24 @@ export default function Home() {
     { libraryId: string; deckId: number; value: string } | null
   >(null);
 
+  useEffect(() => {
+    if (!openDeckMenu) return;
+
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target;
+      if (!(target instanceof Element)) {
+        setOpenDeckMenu(null);
+        return;
+      }
+
+      if (target.closest('[data-deck-menu-root="true"]')) return;
+      setOpenDeckMenu(null);
+    }
+
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [openDeckMenu]);
+
   function updateLibrary(libraryId: string, updater: (item: LibraryItem) => LibraryItem) {
     setLibraries((prev) => {
       const next = prev.map((l) => (l.id === libraryId ? updater(l) : l));
@@ -696,7 +714,10 @@ export default function Home() {
                               {scheduled}
                             </div>
 
-                            <div className="relative flex justify-end">
+                            <div
+                              className="relative flex justify-end"
+                              data-deck-menu-root="true"
+                            >
                               <button
                                 type="button"
                                 className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-foreground/15 hover:bg-foreground/5 cursor-pointer"
@@ -772,7 +793,7 @@ export default function Home() {
                 <div>
                   <div className="text-xs text-foreground/70">Deck</div>
                   <div className="text-sm font-medium">
-                    {selectedDeckName ?? "(sin nombre)"}
+                    {selectedDeckName ?? "(unnamed)"}
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
