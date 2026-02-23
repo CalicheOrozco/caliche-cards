@@ -479,7 +479,8 @@ export default function Home() {
 
   const seededLibrariesRef = useRef<Set<string>>(new Set());
 
-  const autoPlayedCardIds = useRef<Set<number>>(new Set());
+  // Prevent double autoplay from re-renders; reset when card changes.
+  const lastAutoPlayedCardIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -905,8 +906,8 @@ export default function Home() {
     if (showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
-    if (autoPlayedCardIds.current.has(currentId)) return;
-    autoPlayedCardIds.current.add(currentId);
+    if (lastAutoPlayedCardIdRef.current === currentId) return;
+    lastAutoPlayedCardIdRef.current = currentId;
 
     // Autoplay can be blocked by the browser; ignore failures.
     void (async () => {
@@ -917,6 +918,12 @@ export default function Home() {
       }
     })();
   }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace]);
+
+  useEffect(() => {
+    if (mode !== "review") {
+      lastAutoPlayedCardIdRef.current = null;
+    }
+  }, [mode]);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
