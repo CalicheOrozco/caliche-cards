@@ -937,7 +937,7 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          {libraries.length > 0 ? (
+          {/* {libraries.length > 0 ? (
             <button
               type="button"
               className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
@@ -945,7 +945,7 @@ export default function Home() {
             >
               Clear all
             </button>
-          ) : null}
+          ) : null} */}
         </header>
 
         {error ? (
@@ -989,7 +989,7 @@ export default function Home() {
                 </p>
               ) : (
                 <div className="rounded-2xl border border-foreground/15">
-                  <div className="grid grid-cols-[1fr_80px_90px_110px_130px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
+                  <div className="hidden sm:grid grid-cols-[1fr_80px_90px_110px_130px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
                     <div>Deck</div>
                     <div className="text-center">New</div>
                     <div className="text-center">Learning</div>
@@ -1035,7 +1035,7 @@ export default function Home() {
                         return (
                           <div
                             key={`${lib.id}:${d.id}`}
-                            className={`grid grid-cols-[1fr_80px_90px_110px_130px_48px] items-center gap-2 rounded-xl px-2 py-2 ${
+                            className={`grid grid-cols-[1fr_48px] sm:grid-cols-[1fr_80px_90px_110px_130px_48px] items-center gap-2 rounded-xl px-2 py-2 ${
                               isSelected
                                 ? "bg-foreground/5"
                                 : "hover:bg-foreground/5"
@@ -1090,16 +1090,16 @@ export default function Home() {
                               </div>
                             </button>
 
-                            <div className="text-center text-sm text-blue-400">
+                            <div className="hidden sm:block text-center text-sm text-blue-400">
                               {overview ? overview.newShown : 0}
                             </div>
-                            <div className="text-center text-sm text-foreground/70">
+                            <div className="hidden sm:block text-center text-sm text-foreground/70">
                               {overview ? overview.learningDue : 0}
                             </div>
-                            <div className="text-center text-sm font-medium text-green-500">
+                            <div className="hidden sm:block text-center text-sm font-medium text-green-500">
                               {overview ? overview.reviewShown : 0}
                             </div>
-                            <div className="text-center text-sm text-foreground/70">
+                            <div className="hidden sm:block text-center text-sm text-foreground/70">
                               {overview
                                 ? `${overview.reviewed}/${overview.total}`
                                 : `0/${fallbackTotal}`}
@@ -1234,6 +1234,18 @@ export default function Home() {
                                   </button>
                                 </div>
                               ) : null}
+                            </div>
+
+                            <div className="col-span-2 sm:hidden pb-1 text-xs text-foreground/70">
+                              <span className="text-blue-400">New {overview ? overview.newShown : 0}</span>
+                              <span> • </span>
+                              <span>Learning {overview ? overview.learningDue : 0}</span>
+                              <span> • </span>
+                              <span className="text-green-500">Review {overview ? overview.reviewShown : 0}</span>
+                              <span> • </span>
+                              <span>
+                                Total {overview ? `${overview.reviewed}/${overview.total}` : `0/${fallbackTotal}`}
+                              </span>
                             </div>
                           </div>
                         );
