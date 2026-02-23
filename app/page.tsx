@@ -477,8 +477,6 @@ export default function Home() {
   const [nowTs, setNowTs] = useState(() => Date.now());
   const [reviewDeckConfig, setReviewDeckConfig] = useState<DeckConfig | null>(null);
 
-  const seededLibrariesRef = useRef<Set<string>>(new Set());
-
   // Prevent double autoplay from re-renders; reset when card changes.
   const lastAutoPlayedCardIdRef = useRef<number | null>(null);
 
@@ -543,7 +541,9 @@ export default function Home() {
       const nextItem: LibraryItem = {
         id,
         name,
-        deck: importedWithRenamedTopLevel,
+        deck: {
+          decks: importedWithRenamedTopLevel.decks.map((d) => ({ id: d.id, name: d.name })),
+        },
         selectedDeckId: defaultDeckId,
         savedAt: Date.now(),
       };
@@ -671,18 +671,6 @@ export default function Home() {
 
     let cancelled = false;
     void (async () => {
-      // Ensure older saved imports are present in the scheduler DB so totals work.
-      for (const lib of libraries) {
-        if (seededLibrariesRef.current.has(lib.id)) continue;
-        try {
-          await upsertImportedDeck(lib.id, lib.deck);
-        } catch {
-          // ignore
-        } finally {
-          seededLibrariesRef.current.add(lib.id);
-        }
-      }
-
       const pairs = libraries.flatMap((lib) =>
         lib.deck.decks.map((d) => ({
           key: `${lib.id}:${d.id}`,
@@ -757,7 +745,6 @@ export default function Home() {
 
     updateLibrary(libraryId, (item) => {
       const nextDecks = item.deck.decks.filter((d) => !toDeleteIds.has(d.id));
-      const nextCards = item.deck.cards.filter((c) => !toDeleteIds.has(c.deckId));
       const nextSelected =
         item.selectedDeckId != null && toDeleteIds.has(item.selectedDeckId)
           ? (nextDecks[0]?.id ?? null)
@@ -766,7 +753,7 @@ export default function Home() {
       return {
         ...item,
         selectedDeckId: nextSelected,
-        deck: { decks: nextDecks, cards: nextCards },
+        deck: { decks: nextDecks },
       };
     });
   }
@@ -937,7 +924,7 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          {/* {libraries.length > 0 ? (
+          {libraries.length > 0 ? (
             <button
               type="button"
               className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
@@ -945,7 +932,7 @@ export default function Home() {
             >
               Clear all
             </button>
-          ) : null} */}
+          ) : null}
         </header>
 
         {error ? (
@@ -1000,13 +987,6 @@ export default function Home() {
 
                   <div className="divide-y divide-foreground/10">
                     {libraries.flatMap((lib) => {
-                      const noteIdsByDeckId = new Map<number, Set<number>>();
-                      for (const c of lib.deck.cards) {
-                        const set = noteIdsByDeckId.get(c.deckId) ?? new Set<number>();
-                        set.add(c.noteId);
-                        noteIdsByDeckId.set(c.deckId, set);
-                      }
-
                       return lib.deck.decks.map((d) => {
                         const depth = Math.max(
                           0,
@@ -1014,7 +994,6 @@ export default function Home() {
                         );
                         const display =
                           d.name.split("::").slice(-1)[0] ?? d.name;
-                        const fallbackTotal = noteIdsByDeckId.get(d.id)?.size ?? 0;
                         const overview = deckOverviews[`${lib.id}:${d.id}`] ?? null;
                         const isSelected =
                           (activeLibrary?.id ?? null) === lib.id &&
@@ -1102,7 +1081,7 @@ export default function Home() {
                             <div className="hidden sm:block text-center text-sm text-foreground/70">
                               {overview
                                 ? `${overview.reviewed}/${overview.total}`
-                                : `0/${fallbackTotal}`}
+                                : "—"}
                             </div>
 
                             <div
@@ -1244,7 +1223,7 @@ export default function Home() {
                               <span className="text-green-500">Review {overview ? overview.reviewShown : 0}</span>
                               <span> • </span>
                               <span>
-                                Total {overview ? `${overview.reviewed}/${overview.total}` : `0/${fallbackTotal}`}
+                                Total {overview ? `${overview.reviewed}/${overview.total}` : "—"}
                               </span>
                             </div>
                           </div>
