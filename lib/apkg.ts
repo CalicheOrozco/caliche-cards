@@ -145,6 +145,35 @@ function guessAudioMimeType(filename: string): string {
   return "application/octet-stream";
 }
 
+function guessMediaMimeType(filename: string): string {
+  const lower = filename.toLowerCase();
+
+  // Audio
+  if (
+    lower.endsWith(".mp3") ||
+    lower.endsWith(".wav") ||
+    lower.endsWith(".ogg") ||
+    lower.endsWith(".flac") ||
+    lower.endsWith(".m4a")
+  ) {
+    return guessAudioMimeType(filename);
+  }
+
+  // Images (common Anki deck formats)
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".bmp")) return "image/bmp";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+
+  // Video (best-effort)
+  if (lower.endsWith(".mp4")) return "video/mp4";
+  if (lower.endsWith(".webm")) return "video/webm";
+
+  return "application/octet-stream";
+}
+
 function extractSoundFilenames(html: string): string[] {
   const out: string[] = [];
   const re = /\[sound:([^\]]+)\]/gi;
@@ -154,6 +183,49 @@ function extractSoundFilenames(html: string): string[] {
     if (name) out.push(name);
   }
   return out;
+}
+
+function tryDecodeURIComponent(value: string): string | null {
+  try {
+    const decoded = decodeURIComponent(value);
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function extractImageFilenames(html: string): string[] {
+  // Keep this intentionally lightweight; we only need to find local filenames.
+  const out = new Set<string>();
+  const re = /<img\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(html)) !== null) {
+    const raw = String(match[1] ?? match[2] ?? match[3] ?? "").trim();
+    if (!raw) continue;
+
+    // Ignore remote/inline content.
+    if (/^(?:https?:|data:|blob:|file:|about:)/i.test(raw)) continue;
+
+    // Strip query/hash, normalize common prefixes.
+    const noQuery = raw.split(/[?#]/)[0] ?? raw;
+    let name = noQuery
+      .replace(/^collection\.media\//i, "")
+      .replace(/^\.\/+/, "")
+      .replace(/^\/+/, "")
+      .trim();
+
+    if (!name) continue;
+
+    const decoded = tryDecodeURIComponent(name);
+    if (decoded && decoded.trim()) {
+      name = decoded.trim();
+    }
+
+    out.add(name);
+  }
+
+  return Array.from(out);
 }
 
 function escapeRegExp(value: string): string {
@@ -764,7 +836,7 @@ export async function importApkg(
     const cardsRes = db.exec("SELECT id, nid, did FROM cards");
     const cards: ImportedCard[] = [];
 
-    const referencedAudio = new Set<string>();
+    const referencedMedia = new Set<string>();
 
     if (cardsRes[0]) {
       const values =
@@ -793,7 +865,10 @@ export async function importApkg(
 
         for (const html of [front, back, ...fieldsHtml]) {
           for (const filename of extractSoundFilenames(html)) {
-            referencedAudio.add(filename);
+            referencedMedia.add(filename);
+          }
+          for (const filename of extractImageFilenames(html)) {
+            referencedMedia.add(filename);
           }
         }
 
@@ -836,14 +911,18 @@ export async function importApkg(
       console.info(
         "[apkg] cards=",
         cards.length,
-        "referencedAudio=",
-        referencedAudio.size
+        "referencedMedia=",
+        referencedMedia.size
       );
     }
 
-    if (referencedAudio.size > 0) {
+    if (referencedMedia.size > 0) {
       const { saveMediaItems } = await import("./mediaStorage");
-      const items: Array<{ name: string; blob: Blob }> = [];
+
+      const namespace = opts?.mediaNamespace ?? "default";
+      const BATCH_SIZE = 75;
+      let batch: Array<{ name: string; blob: Blob }> = [];
+      let savedCount = 0;
 
       let missingInMediaMap = 0;
       let missingZipEntry = 0;
@@ -851,24 +930,69 @@ export async function importApkg(
       const sampleMissingInMediaMap: string[] = [];
       const sampleMissingZipEntry: string[] = [];
 
-      for (const filename of referencedAudio) {
-        const trimmed = filename.trim();
-        const key =
-          mediaKeyByFilename.get(trimmed) ??
-          mediaKeyByLowerFilename.get(trimmed.toLowerCase()) ??
-          null;
+      async function flushBatch() {
+        if (batch.length === 0) return;
+        await saveMediaItems(namespace, batch);
+        savedCount += batch.length;
+        batch = [];
+      }
+
+      for (const filenameRaw of referencedMedia) {
+        const trimmedRaw = String(filenameRaw ?? "").trim();
+        if (!trimmedRaw) continue;
+
+        const decoded = tryDecodeURIComponent(trimmedRaw);
+        const plusAsSpace = trimmedRaw.includes("+")
+          ? trimmedRaw.replace(/\+/g, " ")
+          : null;
+        const decodedPlusAsSpace = decoded && decoded.includes("+")
+          ? decoded.replace(/\+/g, " ")
+          : null;
+        const candidates = Array.from(
+          new Set(
+            [trimmedRaw, decoded ?? "", plusAsSpace ?? "", decodedPlusAsSpace ?? ""]
+              .map((s) => String(s ?? "").trim())
+              .filter((s) => s.length > 0)
+          )
+        );
+
+        let resolvedName: string = candidates[0] ?? trimmedRaw;
+        let key: string | null = null;
+        for (const cand of candidates) {
+          key =
+            mediaKeyByFilename.get(cand) ??
+            mediaKeyByLowerFilename.get(cand.toLowerCase()) ??
+            null;
+          if (key) {
+            resolvedName = cand;
+            break;
+          }
+        }
 
         if (!key) {
-          const directByName = findZipFile(zip, trimmed) as
+          let directByName:
             | { async: (type: "uint8array") => Promise<Uint8Array> }
-            | null;
-          if (directByName) {
+            | null = null;
+          let directName: string | null = null;
+
+          for (const cand of candidates) {
+            directByName = findZipFile(zip, cand) as
+              | { async: (type: "uint8array") => Promise<Uint8Array> }
+              | null;
+            if (directByName) {
+              directName = cand;
+              break;
+            }
+          }
+
+          if (directByName && directName) {
             try {
               const bytes = await directByName.async("uint8array");
               const maybeDecoded = await maybeDecompressZstd(bytes);
               const copy = new Uint8Array(maybeDecoded);
-              const blob = new Blob([copy], { type: guessAudioMimeType(trimmed) });
-              items.push({ name: trimmed, blob });
+              const blob = new Blob([copy], { type: guessMediaMimeType(directName) });
+              batch.push({ name: directName, blob });
+              if (batch.length >= BATCH_SIZE) await flushBatch();
               usedDirectFilename += 1;
               continue;
             } catch {
@@ -877,7 +1001,7 @@ export async function importApkg(
           }
 
           missingInMediaMap += 1;
-          if (sampleMissingInMediaMap.length < 5) sampleMissingInMediaMap.push(trimmed);
+          if (sampleMissingInMediaMap.length < 5) sampleMissingInMediaMap.push(trimmedRaw);
           continue;
         }
         const entry = findZipFile(zip, key) as
@@ -885,7 +1009,9 @@ export async function importApkg(
           | null;
         if (!entry) {
           missingZipEntry += 1;
-          if (sampleMissingZipEntry.length < 5) sampleMissingZipEntry.push(`${trimmed} -> ${key}`);
+          if (sampleMissingZipEntry.length < 5) {
+            sampleMissingZipEntry.push(`${resolvedName} -> ${key}`);
+          }
           continue;
         }
 
@@ -893,33 +1019,45 @@ export async function importApkg(
           const bytes = await entry.async("uint8array");
           const maybeDecoded = await maybeDecompressZstd(bytes);
           const copy = new Uint8Array(maybeDecoded);
-          const blob = new Blob([copy], { type: guessAudioMimeType(filename) });
-          items.push({ name: filename, blob });
+          const blob = new Blob([copy], { type: guessMediaMimeType(resolvedName) });
+          batch.push({ name: resolvedName, blob });
+          if (batch.length >= BATCH_SIZE) await flushBatch();
         } catch {
           // ignore missing/corrupt media
         }
       }
 
+      if (process.env.NODE_ENV !== "production") {
+        console.info(
+          "[apkg] saving media:",
+          "planned=",
+          referencedMedia.size,
+          "batchSize=",
+          BATCH_SIZE,
+          "usedDirectFilename=",
+          usedDirectFilename,
+          "missingInMediaMap=",
+          missingInMediaMap,
+          sampleMissingInMediaMap.length ? sampleMissingInMediaMap : "",
+          "missingZipEntry=",
+          missingZipEntry,
+          sampleMissingZipEntry.length ? sampleMissingZipEntry : ""
+        );
+      }
+
       try {
-        if (process.env.NODE_ENV !== "production") {
-           
-          console.info(
-            "[apkg] saving media:",
-            "willSave=",
-            items.length,
-            "usedDirectFilename=",
-            usedDirectFilename,
-            "missingInMediaMap=",
-            missingInMediaMap,
-            sampleMissingInMediaMap.length ? sampleMissingInMediaMap : "",
-            "missingZipEntry=",
-            missingZipEntry,
-            sampleMissingZipEntry.length ? sampleMissingZipEntry : ""
-          );
-        }
-        await saveMediaItems(opts?.mediaNamespace ?? "default", items);
-      } catch {
-        // ignore storage errors
+        await flushBatch();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(
+          `No pude guardar el media (imágenes/audio) en el almacenamiento local. ` +
+            `Es posible que el navegador haya alcanzado su cuota de IndexedDB. ` +
+            `Detalle: ${msg}`
+        );
+      }
+
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[apkg] saved media items:", savedCount);
       }
     }
 

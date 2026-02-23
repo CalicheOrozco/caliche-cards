@@ -164,6 +164,180 @@ function SoundButton({
   );
 }
 
+function localMediaCandidatesFromSrc(src: string): string[] {
+  const raw = String(src ?? "").trim();
+  if (!raw) return [];
+
+  // Ignore remote/inline sources.
+  if (/^(?:https?:|data:|blob:|file:|about:)/i.test(raw)) return [];
+
+  const noQuery = raw.split(/[?#]/)[0] ?? raw;
+  const name = String(noQuery)
+    .replace(/^collection\.media\//i, "")
+    .replace(/^\.\/+/, "")
+    .replace(/^\/+/, "")
+    .trim();
+
+  if (!name) return [];
+
+  const candidates: string[] = [name];
+
+  // Some decks URL-encode media filenames.
+  try {
+    const decoded = decodeURIComponent(name);
+    if (decoded && decoded !== name) candidates.push(decoded);
+  } catch {
+    // ignore
+  }
+
+  // Some templates use + for spaces.
+  if (name.includes("+")) candidates.push(name.replace(/\+/g, " "));
+
+  return Array.from(new Set(candidates.map((s) => s.trim()).filter(Boolean)));
+}
+
+function preprocessHtmlForLocalImages(html: string): string {
+  const input = String(html ?? "");
+  if (!input) return input;
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(input, "text/html");
+    const imgs = Array.from(doc.querySelectorAll("img"));
+
+    for (const img of imgs) {
+      const src = img.getAttribute("src") ?? "";
+      const candidates = localMediaCandidatesFromSrc(src);
+      if (candidates.length === 0) continue;
+
+      // Prevent the browser from requesting `/<filename>` immediately.
+      img.setAttribute("data-caliche-orig-src", src);
+      img.setAttribute("data-caliche-src", candidates[0] ?? src);
+      img.setAttribute("src", "data:,");
+    }
+
+    return doc.body.innerHTML;
+  } catch {
+    return input;
+  }
+}
+
+function HtmlWithMedia({
+  namespace,
+  html,
+}: {
+  namespace: string;
+  html: string;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const objectUrlsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const revokeAll = () => {
+      for (const url of objectUrlsRef.current) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+      objectUrlsRef.current = [];
+    };
+
+    revokeAll();
+    const root = ref.current;
+    if (!root) {
+      return () => {
+        cancelled = true;
+        revokeAll();
+      };
+    }
+
+    // Important: set innerHTML imperatively so React won't overwrite any
+    // attribute changes we apply (like swapping img src to blob: URLs).
+    root.innerHTML = html;
+
+    const imgs = Array.from(root.querySelectorAll("img"));
+    if (imgs.length === 0) {
+      return () => {
+        cancelled = true;
+        revokeAll();
+      };
+    }
+
+    void (async () => {
+      let resolvedCount = 0;
+      let missingCount = 0;
+
+      for (const img of imgs) {
+        if (cancelled) return;
+
+        const rawSrc =
+          img.getAttribute("data-caliche-src") ??
+          img.getAttribute("data-caliche-orig-src") ??
+          img.getAttribute("src") ??
+          "";
+        const candidates = localMediaCandidatesFromSrc(rawSrc);
+        if (candidates.length === 0) continue;
+
+        let blob: Blob | null = null;
+        let resolved: string | null = null;
+        for (const cand of candidates) {
+          blob = await getMediaBlob(namespace, cand);
+          if (blob) {
+            resolved = cand;
+            break;
+          }
+        }
+        if (!blob) {
+          missingCount += 1;
+          img.setAttribute("data-caliche-missing", "1");
+          continue;
+        }
+
+        const url = URL.createObjectURL(blob);
+        objectUrlsRef.current.push(url);
+
+        if (cancelled) {
+          try {
+            URL.revokeObjectURL(url);
+          } catch {
+            // ignore
+          }
+          continue;
+        }
+
+        img.setAttribute("src", url);
+        if (resolved) img.setAttribute("data-caliche-media", resolved);
+        img.removeAttribute("data-caliche-missing");
+        resolvedCount += 1;
+      }
+
+      if (process.env.NODE_ENV !== "production") {
+        if (resolvedCount > 0 || missingCount > 0) {
+          console.info(
+            "[media] images resolved=",
+            resolvedCount,
+            "missing=",
+            missingCount,
+            "namespace=",
+            namespace
+          );
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      revokeAll();
+    };
+  }, [namespace, html]);
+
+  return <div ref={ref} />;
+}
+
 function CardFace({
   namespace,
   html,
@@ -177,7 +351,10 @@ function CardFace({
 }) {
   const parts = useMemo(() => {
     const base = splitBySoundTag(String(html ?? "")).map((p) => {
-      if (p.type === "html") return { ...p, value: sanitize(p.value) };
+      if (p.type === "html") {
+        const safe = sanitize(p.value);
+        return { ...p, value: preprocessHtmlForLocalImages(safe) };
+      }
       return p;
     });
 
@@ -198,7 +375,7 @@ function CardFace({
 
   return (
     <div
-      className={`text-foreground [&_a]:underline [&_a:hover]:opacity-80 [&_br]:block [&_img]:max-w-full [&_img]:h-auto [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 ${className ?? "text-base leading-7"}`}
+      className={`text-foreground [&_a]:underline [&_a:hover]:opacity-80 [&_br]:block [&_img]:block [&_img]:mx-auto [&_img]:max-w-full [&_img]:h-auto [&_img]:max-h-[45vh] sm:[&_img]:max-h-[60vh] [&_img]:object-contain [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 ${className ?? "text-base leading-7"}`}
     >
       {parts.map((p, idx) => {
         if (p.type === "sound") {
@@ -210,9 +387,10 @@ function CardFace({
         }
 
         return (
-          <div
+          <HtmlWithMedia
             key={`html-${idx}`}
-            dangerouslySetInnerHTML={{ __html: p.value }}
+            namespace={namespace}
+            html={p.value}
           />
         );
       })}
@@ -248,7 +426,7 @@ function shouldHideFieldLabel(label: string, hiddenLabels: string[]) {
   return hidden.has(target);
 }
 
-  const HIDDEN_FIELD_LABELS = ["Índice", "Sort Index"];
+  const HIDDEN_FIELD_LABELS = ["Índice", "Sort Index","Image"];
 
   const nonEmpty = list
     .map((value, index) => ({
@@ -752,7 +930,7 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          {/* {libraries.length > 0 ? (
+          {libraries.length > 0 ? (
             <button
               type="button"
               className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
@@ -760,7 +938,7 @@ export default function Home() {
             >
               Clear all
             </button>
-          ) : null} */}
+          ) : null}
         </header>
 
         {error ? (
