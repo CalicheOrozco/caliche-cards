@@ -10,6 +10,7 @@
     "postinstall": "node scripts/copy-sql-wasm.mjs"
   },
   "dependencies": {
+    "dexie": "^4.3.0",
     "dompurify": "^3.2.6",
     "fzstd": "^0.1.1",
     "idb": "^8.0.3",

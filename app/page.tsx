@@ -1,10 +1,10 @@
 "use client";
 
 import DOMPurify from "dompurify";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FaCog, FaPlay, FaTimes } from "react-icons/fa";
 
-import type { ImportedCard, ImportedDeck } from "../lib/apkg";
+import type { ImportedDeck } from "../lib/apkg";
 import { importApkg } from "../lib/apkg";
 import {
   clearLastState,
@@ -13,6 +13,20 @@ import {
   type LibraryItem,
 } from "../lib/deckStorage";
 import { clearMedia, getMediaBlob } from "../lib/mediaStorage";
+import type { DeckRef, NextCard } from "../lib/studyTypes";
+import {
+  answerCard,
+  getDeckConfig,
+  getDeckOverview,
+  getNextCard,
+  setDeckNewPerDay,
+  startStudySession,
+  upsertImportedDeck,
+  type DeckOverview,
+} from "../lib/studyApi";
+import { deleteStudyDb } from "../lib/studyDb";
+import type { DeckConfig } from "../lib/studyTypes";
+import { scheduleAnswer } from "../lib/scheduler";
 
 type Mode = "import" | "review";
 
@@ -276,8 +290,16 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [queue, setQueue] = useState<ImportedCard[]>([]);
   const [showAnswer, setShowAnswer] = useState(false);
+  const [reviewRef, setReviewRef] = useState<DeckRef | null>(null);
+  const [current, setCurrent] = useState<NextCard | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewOverview, setReviewOverview] = useState<DeckOverview | null>(null);
+  const [deckOverviews, setDeckOverviews] = useState<Record<string, DeckOverview>>({});
+  const [nowTs, setNowTs] = useState(() => Date.now());
+  const [reviewDeckConfig, setReviewDeckConfig] = useState<DeckConfig | null>(null);
+
+  const seededLibrariesRef = useRef<Set<string>>(new Set());
 
   const autoPlayedCardIds = useRef<Set<number>>(new Set());
 
@@ -347,6 +369,9 @@ export default function Home() {
         savedAt: Date.now(),
       };
 
+      // Seed scheduler persistence (CardState / logs) for this import.
+      await upsertImportedDeck(id, importedWithRenamedTopLevel);
+
       setLibraries((prev) => {
         const next = [...prev, nextItem];
         void saveLastState({
@@ -369,11 +394,15 @@ export default function Home() {
   async function onClearSaved() {
     await clearLastState();
     await clearMedia();
+    await deleteStudyDb();
     setLibraries([]);
     setActiveLibraryId(null);
     setMode("import");
-    setQueue([]);
     setShowAnswer(false);
+    setReviewRef(null);
+    setCurrent(null);
+    setReviewOverview(null);
+    setDeckOverviews({});
   }
 
   const [openDeckMenu, setOpenDeckMenu] = useState<
@@ -382,24 +411,130 @@ export default function Home() {
   const [editingDeck, setEditingDeck] = useState<
     { libraryId: string; deckId: number; value: string } | null
   >(null);
+  const [editingNewPerDay, setEditingNewPerDay] = useState<
+    { libraryId: string; deckId: number; value: string } | null
+  >(null);
+
+  const commitNewPerDay = useCallback(
+    async (libraryId: string, deckId: number, raw: string) => {
+      const next = Number(raw);
+      await setDeckNewPerDay({ libraryId, deckId }, next);
+
+      // Optimistically reflect in UI even if overview refresh lags.
+      setDeckOverviews((prev) => {
+        const key = `${libraryId}:${deckId}`;
+        const existing = prev[key];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          [key]: {
+            ...existing,
+            config: {
+              ...existing.config,
+              newPerDay: Math.max(0, Math.floor(next || 0)),
+            },
+          },
+        };
+      });
+
+      const ov = await getDeckOverview({ libraryId, deckId });
+      setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
+
+      if (reviewRef?.libraryId === libraryId && reviewRef.deckId === deckId) {
+        setReviewOverview(ov);
+        const cfg = await getDeckConfig({ libraryId, deckId });
+        setReviewDeckConfig(cfg);
+      }
+    },
+    [reviewRef]
+  );
 
   useEffect(() => {
     if (!openDeckMenu) return;
 
+    const menu = openDeckMenu;
+
+    function maybeSaveNewPerDay() {
+      if (!editingNewPerDay) return;
+      if (
+        editingNewPerDay.libraryId === menu.libraryId &&
+        editingNewPerDay.deckId === menu.deckId
+      ) {
+        void commitNewPerDay(
+          editingNewPerDay.libraryId,
+          editingNewPerDay.deckId,
+          editingNewPerDay.value
+        );
+        setEditingNewPerDay(null);
+      }
+    }
+
     function onPointerDown(e: PointerEvent) {
       const target = e.target;
       if (!(target instanceof Element)) {
+        maybeSaveNewPerDay();
         setOpenDeckMenu(null);
         return;
       }
 
       if (target.closest('[data-deck-menu-root="true"]')) return;
+
+      maybeSaveNewPerDay();
       setOpenDeckMenu(null);
     }
 
     document.addEventListener("pointerdown", onPointerDown, true);
     return () => document.removeEventListener("pointerdown", onPointerDown, true);
-  }, [openDeckMenu]);
+  }, [openDeckMenu, editingNewPerDay, commitNewPerDay]);
+
+  useEffect(() => {
+    if (libraries.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      // Ensure older saved imports are present in the scheduler DB so totals work.
+      for (const lib of libraries) {
+        if (seededLibrariesRef.current.has(lib.id)) continue;
+        try {
+          await upsertImportedDeck(lib.id, lib.deck);
+        } catch {
+          // ignore
+        } finally {
+          seededLibrariesRef.current.add(lib.id);
+        }
+      }
+
+      const pairs = libraries.flatMap((lib) =>
+        lib.deck.decks.map((d) => ({
+          key: `${lib.id}:${d.id}`,
+          ref: { libraryId: lib.id, deckId: d.id } satisfies DeckRef,
+        }))
+      );
+
+      const entries = await Promise.all(
+        pairs.map(async ({ key, ref }) => {
+          try {
+            const ov = await getDeckOverview(ref);
+            return [key, ov] as const;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      if (cancelled) return;
+      const next: Record<string, DeckOverview> = {};
+      for (const e of entries) {
+        if (!e) continue;
+        next[e[0]] = e[1];
+      }
+      setDeckOverviews(next);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [libraries]);
 
   function updateLibrary(libraryId: string, updater: (item: LibraryItem) => LibraryItem) {
     setLibraries((prev) => {
@@ -411,11 +546,6 @@ export default function Home() {
       });
       return next;
     });
-  }
-
-  function pickDeck(libraryId: string, deckId: number) {
-    setActiveLibraryId(libraryId);
-    updateLibrary(libraryId, (item) => ({ ...item, selectedDeckId: deckId }));
   }
 
   function renameDeck(libraryId: string, deckId: number, nextName: string) {
@@ -462,69 +592,131 @@ export default function Home() {
     });
   }
 
-  function startReview() {
-    setError(null);
-    if (!activeLibrary || !activeDeck) return;
-    if (selectedDeckId == null) {
-      setError("Select a deck.");
-      return;
-    }
-
-    const cards = activeDeck.cards.filter((c) => c.deckId === selectedDeckId);
-    if (cards.length === 0) {
-      setError("That deck has no cards.");
-      return;
-    }
-
-    setQueue(cards);
+  async function loadNext(ref: DeckRef, excludeCardId?: number) {
+    const [next, ov] = await Promise.all([
+      getNextCard(ref, {
+        learnAheadMs: 60 * 60 * 1000,
+        learnAheadMode: "learn+relearn",
+        excludeCardId,
+      }),
+      getDeckOverview(ref),
+    ]);
+    setCurrent(next);
+    setReviewOverview(ov);
+    setDeckOverviews((prev) => ({ ...prev, [`${ref.libraryId}:${ref.deckId}`]: ov }));
     setShowAnswer(false);
-    setMode("review");
+  }
+
+  // Keep a lightweight clock for countdown UI.
+  useEffect(() => {
+    if (mode !== "review") return;
+    const id = window.setInterval(() => setNowTs(Date.now()), 250);
+    return () => window.clearInterval(id);
+  }, [mode]);
+
+  // If nothing is due right now but we have a next due timestamp, auto-refresh
+  // when it becomes due so the user doesn't need to exit/re-enter.
+  useEffect(() => {
+    if (mode !== "review") return;
+    if (!reviewRef) return;
+    if (current) return;
+    const ts = reviewOverview?.nextDueTs ?? null;
+    if (ts == null) return;
+
+    const delayMs = Math.max(250, ts - Date.now());
+    const id = window.setTimeout(() => {
+      void loadNext(reviewRef);
+    }, delayMs);
+
+    return () => window.clearTimeout(id);
+  }, [mode, reviewRef, current, reviewOverview?.nextDueTs]);
+
+  async function beginReview(libraryId: string, deckId: number) {
+    setError(null);
+    setReviewBusy(true);
+
+    const ref: DeckRef = { libraryId, deckId };
+    try {
+      const ov = await getDeckOverview(ref);
+      if (ov.total === 0) {
+        setError("That deck has no cards.");
+        return;
+      }
+
+      const cfg = await getDeckConfig(ref);
+      setReviewDeckConfig(cfg);
+
+      setReviewRef(ref);
+      setMode("review");
+      await startStudySession(ref);
+      await loadNext(ref);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error starting review";
+      setError(msg);
+    } finally {
+      setReviewBusy(false);
+    }
   }
 
   function startReviewFor(libraryId: string, deckId: number) {
-    setError(null);
     const lib = libraries.find((l) => l.id === libraryId) ?? null;
     if (!lib) return;
 
     setActiveLibraryId(libraryId);
     updateLibrary(libraryId, (item) => ({ ...item, selectedDeckId: deckId }));
+    void beginReview(libraryId, deckId);
+  }
 
-    const cards = lib.deck.cards.filter((c) => c.deckId === deckId);
-    if (cards.length === 0) {
-      setError("That deck has no cards.");
-      return;
+  async function onAnswer(result: "fail" | "pass") {
+    if (!reviewRef || !current) return;
+    setReviewBusy(true);
+    try {
+      const answeredId = current.card.cardId;
+      await answerCard(reviewRef, answeredId, result);
+      await loadNext(reviewRef, answeredId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error saving answer";
+      setError(msg);
+    } finally {
+      setReviewBusy(false);
     }
-
-    setQueue(cards);
-    setShowAnswer(false);
-    setMode("review");
   }
 
-  function passCard() {
-    setQueue((q) => q.slice(1));
-    setShowAnswer(false);
+  function formatIn(ts: number, now: number): string {
+    const ms = ts - now;
+    if (ms <= 0) return "now";
+    const totalSec = Math.ceil(ms / 1000);
+    if (totalSec < 60) return `${totalSec}s`;
+    const totalMin = Math.ceil(totalSec / 60);
+    if (totalMin < 60) return `${totalMin}m`;
+    const totalHr = Math.ceil(totalMin / 60);
+    if (totalHr < 24) return `${totalHr}h`;
+    const totalDay = Math.ceil(totalHr / 24);
+    return `${totalDay}d`;
   }
 
-  function failCard() {
-    setQueue((q) => {
-      const [current, ...rest] = q;
-      if (!current) return q;
-      return [...rest, current];
-    });
-    setShowAnswer(false);
-  }
+  const nextDueLabels = useMemo(() => {
+    if (!current || !reviewDeckConfig) return null;
 
-  const current = queue[0] ?? null;
-  const currentId = current?.id ?? null;
+    const fail = scheduleAnswer(current.state, "fail", nowTs, reviewDeckConfig);
+    const pass = scheduleAnswer(current.state, "pass", nowTs, reviewDeckConfig);
+
+    return {
+      fail: formatIn(fail.nextDue, nowTs),
+      pass: formatIn(pass.nextDue, nowTs),
+    };
+  }, [current, reviewDeckConfig, nowTs]);
+
+  const currentId = current?.card.cardId ?? null;
   const currentMissingFields =
     !!current &&
-    (!Array.isArray(current.fieldsHtml) || current.fieldsHtml.length === 0);
+    (!Array.isArray(current.card.fieldsHtml) || current.card.fieldsHtml.length === 0);
 
   const promotedSound = useMemo(() => {
     if (!current) return null;
-    const fromFront = extractFirstSoundFilename(current.frontHtml);
+    const fromFront = extractFirstSoundFilename(current.card.frontHtml);
     if (fromFront) return { filename: fromFront, source: "front" as const };
-    const fromBack = extractFirstSoundFilename(current.backHtml);
+    const fromBack = extractFirstSoundFilename(current.card.backHtml);
     if (fromBack) return { filename: fromBack, source: "back" as const };
     return null;
   }, [current]);
@@ -560,7 +752,7 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          {libraries.length > 0 ? (
+          {/* {libraries.length > 0 ? (
             <button
               type="button"
               className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
@@ -568,7 +760,7 @@ export default function Home() {
             >
               Clear all
             </button>
-          ) : null}
+          ) : null} */}
         </header>
 
         {error ? (
@@ -612,22 +804,22 @@ export default function Home() {
                 </p>
               ) : (
                 <div className="rounded-2xl border border-foreground/15">
-                  <div className="grid grid-cols-[1fr_80px_90px_110px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
+                  <div className="grid grid-cols-[1fr_80px_90px_110px_130px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
                     <div>Deck</div>
                     <div className="text-center">New</div>
                     <div className="text-center">Learning</div>
                     <div className="text-center">Review</div>
+                    <div className="text-center">Total</div>
                     <div />
                   </div>
 
                   <div className="divide-y divide-foreground/10">
                     {libraries.flatMap((lib) => {
-                      const countsByDeckId = new Map<number, number>();
+                      const noteIdsByDeckId = new Map<number, Set<number>>();
                       for (const c of lib.deck.cards) {
-                        countsByDeckId.set(
-                          c.deckId,
-                          (countsByDeckId.get(c.deckId) ?? 0) + 1
-                        );
+                        const set = noteIdsByDeckId.get(c.deckId) ?? new Set<number>();
+                        set.add(c.noteId);
+                        noteIdsByDeckId.set(c.deckId, set);
                       }
 
                       return lib.deck.decks.map((d) => {
@@ -637,7 +829,8 @@ export default function Home() {
                         );
                         const display =
                           d.name.split("::").slice(-1)[0] ?? d.name;
-                        const scheduled = countsByDeckId.get(d.id) ?? 0;
+                        const fallbackTotal = noteIdsByDeckId.get(d.id)?.size ?? 0;
+                        const overview = deckOverviews[`${lib.id}:${d.id}`] ?? null;
                         const isSelected =
                           (activeLibrary?.id ?? null) === lib.id &&
                           (lib.selectedDeckId ?? null) === d.id;
@@ -650,10 +843,14 @@ export default function Home() {
                           editingDeck?.libraryId === lib.id &&
                           editingDeck.deckId === d.id;
 
+                        const isEditingNewPerDay =
+                          editingNewPerDay?.libraryId === lib.id &&
+                          editingNewPerDay.deckId === d.id;
+
                         return (
                           <div
                             key={`${lib.id}:${d.id}`}
-                            className={`grid grid-cols-[1fr_80px_90px_110px_48px] items-center gap-2 rounded-xl px-2 py-2 ${
+                            className={`grid grid-cols-[1fr_80px_90px_110px_130px_48px] items-center gap-2 rounded-xl px-2 py-2 ${
                               isSelected
                                 ? "bg-foreground/5"
                                 : "hover:bg-foreground/5"
@@ -708,10 +905,19 @@ export default function Home() {
                               </div>
                             </button>
 
-                            <div className="text-center text-sm text-blue-400">0</div>
-                            <div className="text-center text-sm text-foreground/40">0</div>
+                            <div className="text-center text-sm text-blue-400">
+                              {overview ? overview.newShown : 0}
+                            </div>
+                            <div className="text-center text-sm text-foreground/70">
+                              {overview ? overview.learningDue : 0}
+                            </div>
                             <div className="text-center text-sm font-medium text-green-500">
-                              {scheduled}
+                              {overview ? overview.reviewShown : 0}
+                            </div>
+                            <div className="text-center text-sm text-foreground/70">
+                              {overview
+                                ? `${overview.reviewed}/${overview.total}`
+                                : `0/${fallbackTotal}`}
                             </div>
 
                             <div
@@ -723,13 +929,26 @@ export default function Home() {
                                 className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-foreground/15 hover:bg-foreground/5 cursor-pointer"
                                 aria-label="Settings"
                                 title="Settings"
-                                onClick={() =>
-                                  setOpenDeckMenu(
-                                    menuOpen
-                                      ? null
-                                      : { libraryId: lib.id, deckId: d.id }
-                                  )
-                                }
+                                onClick={() => {
+                                  if (menuOpen) {
+                                    if (
+                                      editingNewPerDay &&
+                                      editingNewPerDay.libraryId === lib.id &&
+                                      editingNewPerDay.deckId === d.id
+                                    ) {
+                                      void commitNewPerDay(
+                                        editingNewPerDay.libraryId,
+                                        editingNewPerDay.deckId,
+                                        editingNewPerDay.value
+                                      );
+                                      setEditingNewPerDay(null);
+                                    }
+                                    setOpenDeckMenu(null);
+                                    return;
+                                  }
+
+                                  setOpenDeckMenu({ libraryId: lib.id, deckId: d.id });
+                                }}
                               >
                                 <FaCog className="h-4 w-4" aria-hidden="true" />
                               </button>
@@ -750,6 +969,70 @@ export default function Home() {
                                   >
                                     Rename
                                   </button>
+
+                                  <div className="px-3 py-2">
+                                    <div className="text-xs text-foreground/70">New/day</div>
+                                    <input
+                                      type="number"
+                                      min={0}
+                                      inputMode="numeric"
+                                      value={
+                                        isEditingNewPerDay
+                                          ? editingNewPerDay.value
+                                          : String(overview?.config.newPerDay ?? 10)
+                                      }
+                                      onFocus={() => {
+                                        setEditingNewPerDay({
+                                          libraryId: lib.id,
+                                          deckId: d.id,
+                                          value: String(overview?.config.newPerDay ?? 10),
+                                        });
+                                      }}
+                                      onChange={(e) => {
+                                        setEditingNewPerDay({
+                                          libraryId: lib.id,
+                                          deckId: d.id,
+                                          value: e.target.value,
+                                        });
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key !== "Enter") return;
+                                        const raw = e.currentTarget.value;
+                                        void (async () => {
+                                          await commitNewPerDay(lib.id, d.id, raw);
+                                          setEditingNewPerDay(null);
+                                        })();
+                                      }}
+                                      onBlur={() => {
+                                        const raw = isEditingNewPerDay
+                                          ? editingNewPerDay.value
+                                          : String(overview?.config.newPerDay ?? 10);
+                                        void (async () => {
+                                          await commitNewPerDay(lib.id, d.id, raw);
+                                          setEditingNewPerDay(null);
+                                        })();
+                                      }}
+                                      className="mt-1 w-full rounded-lg border border-foreground/15 bg-background px-3 py-2 text-sm"
+                                    />
+
+                                    <button
+                                      type="button"
+                                      className="mt-2 w-full rounded-lg border border-foreground/15 px-3 py-2 text-sm hover:bg-foreground/5"
+                                      onClick={() => {
+                                        const raw = isEditingNewPerDay
+                                          ? editingNewPerDay.value
+                                          : String(overview?.config.newPerDay ?? 10);
+                                        void (async () => {
+                                          await commitNewPerDay(lib.id, d.id, raw);
+                                          setEditingNewPerDay(null);
+                                          setOpenDeckMenu(null);
+                                        })();
+                                      }}
+                                    >
+                                      Save
+                                    </button>
+                                  </div>
+
                                   <button
                                     type="button"
                                     className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-500 hover:bg-foreground/5"
@@ -795,17 +1078,28 @@ export default function Home() {
                   <div className="text-sm font-medium">
                     {selectedDeckName ?? "(unnamed)"}
                   </div>
+                  <div className="mt-1 text-xs text-foreground/70">
+                    New/day: {reviewOverview?.config.newPerDay ?? "—"}
+                    {reviewOverview
+                      ? ` • Words: ${reviewOverview.reviewed}/${reviewOverview.total}`
+                      : ""}
+                  </div>
                 </div>
                 <div className="flex items-center gap-3">
                   <div className="text-sm text-foreground/70">
-                    {queue.length} left
+                    Due: {reviewOverview ? reviewOverview.newShown + reviewOverview.learningDue + reviewOverview.reviewShown : 0}
+                    {reviewOverview && reviewOverview.learningWaiting > 0
+                      ? ` • Waiting: ${reviewOverview.learningWaiting}`
+                      : ""}
                   </div>
                   <button
                     type="button"
                     onClick={() => {
                       setMode("import");
-                      setQueue([]);
                       setShowAnswer(false);
+                      setReviewRef(null);
+                      setCurrent(null);
+                      setReviewOverview(null);
                     }}
                     className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-foreground/15 hover:bg-foreground/5"
                     title="Exit"
@@ -832,7 +1126,7 @@ export default function Home() {
                     <div className="py-10">
                       <CardFace
                         namespace={activeNamespace}
-                        html={current.frontHtml}
+                        html={current.card.frontHtml}
                         suppressFirstSoundFilename={
                           promotedSound?.source === "front"
                             ? promotedSound.filename
@@ -846,7 +1140,7 @@ export default function Home() {
                       <div className="border-t border-foreground/15 pt-6">
                         <CardFace
                           namespace={activeNamespace}
-                          html={current.backHtml}
+                          html={current.card.backHtml}
                           suppressFirstSoundFilename={
                             promotedSound?.source === "back"
                               ? promotedSound.filename
@@ -860,8 +1154,8 @@ export default function Home() {
                     {showAnswer ? (
                       <FieldsList
                         namespace={activeNamespace}
-                        fields={current.fieldsHtml}
-                        names={current.fieldNames}
+                        fields={current.card.fieldsHtml}
+                        names={current.card.fieldNames}
                       />
                     ) : null}
                   </div>
@@ -870,7 +1164,28 @@ export default function Home() {
                 <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-6 text-center">
                   <div className="text-lg font-semibold">All done for today!</div>
                   <div className="mt-1 text-sm text-foreground/70">
-                    No cards left in the queue.
+                    {reviewOverview?.nextDueTs ? (
+                      (() => {
+                        const ms = Math.max(0, reviewOverview.nextDueTs - nowTs);
+                        const totalSec = Math.ceil(ms / 1000);
+                        const m = Math.floor(totalSec / 60);
+                        const s = totalSec % 60;
+                        const mmss = `${m}:${String(s).padStart(2, "0")}`;
+                        const waiting = reviewOverview.learningWaiting;
+                        return (
+                          <>
+                            Next card in <span className="font-medium">{mmss}</span>
+                            {waiting > 0 ? (
+                              <>
+                                {" "}• Waiting: <span className="font-medium">{waiting}</span>
+                              </>
+                            ) : null}
+                          </>
+                        );
+                      })()
+                    ) : (
+                      <>No more cards due (or you hit today’s limits).</>
+                    )}
                   </div>
                 </div>
               )}
@@ -882,6 +1197,7 @@ export default function Home() {
                       type="button"
                       className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
                       onClick={() => setShowAnswer(true)}
+                      disabled={reviewBusy}
                     >
                       Show answer
                     </button>
@@ -890,16 +1206,18 @@ export default function Home() {
                       <button
                         type="button"
                         className="h-12 flex-1 rounded-full border border-red-500 px-5 text-sm font-medium text-red-500 hover:bg-red-500 hover:text-background"
-                        onClick={failCard}
+                        onClick={() => void onAnswer("fail")}
+                        disabled={reviewBusy}
                       >
-                        Fail
+                        Fail{nextDueLabels ? ` • ${nextDueLabels.fail}` : ""}
                       </button>
                       <button
                         type="button"
                         className="h-12 flex-1 rounded-full border border-green-500 px-5 text-sm font-medium text-green-500 hover:bg-green-500 hover:text-background"
-                        onClick={passCard}
+                        onClick={() => void onAnswer("pass")}
+                        disabled={reviewBusy}
                       >
-                        Pass
+                        Pass{nextDueLabels ? ` • ${nextDueLabels.pass}` : ""}
                       </button>
                     </>
                   )
@@ -909,8 +1227,10 @@ export default function Home() {
                     className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
                     onClick={() => {
                       setMode("import");
-                      setQueue([]);
                       setShowAnswer(false);
+                      setReviewRef(null);
+                      setCurrent(null);
+                      setReviewOverview(null);
                     }}
                   >
                     Back
