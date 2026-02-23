@@ -615,8 +615,8 @@ export default function Home() {
                   <div className="grid grid-cols-[1fr_80px_90px_110px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
                     <div>Deck</div>
                     <div className="text-center">New</div>
-                    <div className="text-center">Learned</div>
-                    <div className="text-center">Due</div>
+                    <div className="text-center">Learning</div>
+                    <div className="text-center">Review</div>
                     <div />
                   </div>
 
