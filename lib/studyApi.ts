@@ -173,7 +173,10 @@ export async function upsertImportedDeck(libraryId: string, imported: ImportedDe
           ...prev,
           deckId: c.deckId,
           noteId: c.noteId,
-          updatedAt: now,
+          // Important: keep updatedAt as the scheduling/progress timestamp.
+          // Re-importing or downloading deck data shouldn't make this look
+          // like a newer progress update than what's in the cloud.
+          updatedAt: prev.updatedAt,
         };
       }
 
@@ -193,7 +196,9 @@ export async function upsertImportedDeck(libraryId: string, imported: ImportedDe
         buriedUntil: null,
         lastReview: null,
         createdAt: now,
-        updatedAt: now,
+        // Seeded state: treat as "unknown/never-synced" progress so it doesn't
+        // overwrite real progress when syncing on a new device.
+        updatedAt: 0,
       };
       return initial;
     });

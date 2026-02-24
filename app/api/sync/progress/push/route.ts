@@ -178,7 +178,18 @@ export async function POST(req: NextRequest) {
   if (cardStates.length > 0) {
     const ops = cardStates.map((s) => ({
       updateOne: {
-        filter: { userId, libraryId, cardId: s.cardId },
+        filter: {
+          userId,
+          libraryId,
+          cardId: s.cardId,
+          $or: [
+            { updatedAt: { $lt: s.updatedAt } },
+            { updatedAt: { $exists: false } },
+            { updatedAt: s.updatedAt },
+            // Recovery/clock-skew safety: if reps increased, progress advanced.
+            { reps: { $lt: s.reps } },
+          ],
+        },
         update: {
           $set: {
             userId,

@@ -1981,9 +1981,26 @@ export default function Home() {
             for (let i = 0; i < remoteCardStates.length; i += 1) {
               const remote = remoteCardStates[i];
               const local = existing[i] ?? null;
-              if (!local || (typeof remote.updatedAt === "number" && remote.updatedAt > (local.updatedAt ?? 0))) {
-                toPut.push(remote);
-              }
+
+              const shouldTakeRemote = (() => {
+                if (!local) return true;
+
+                const remoteUpdated = typeof remote.updatedAt === "number" ? remote.updatedAt : 0;
+                const localUpdated = typeof local.updatedAt === "number" ? local.updatedAt : 0;
+                if (remoteUpdated > localUpdated) return true;
+
+                const remoteReps = typeof remote.reps === "number" ? remote.reps : 0;
+                const localReps = typeof local.reps === "number" ? local.reps : 0;
+                if (remoteReps > localReps) return true;
+
+                const remoteLast = typeof remote.lastReview === "number" ? remote.lastReview : 0;
+                const localLast = typeof local.lastReview === "number" ? local.lastReview : 0;
+                if (remoteLast > localLast) return true;
+
+                return false;
+              })();
+
+              if (shouldTakeRemote) toPut.push(remote);
             }
             if (toPut.length > 0) await db.cardStates.bulkPut(toPut);
           }
@@ -2062,6 +2079,39 @@ export default function Home() {
         }
 
         advance(`Pulled progress for “${lib.name}”.`);
+      }
+
+      // Refresh deck list stats now that IndexedDB has been updated.
+      setPhase("Refreshing deck stats…");
+      const pairs = mergedLibraries.flatMap((lib) =>
+        (lib.deck?.decks ?? []).map((d) => ({
+          key: `${lib.id}:${d.id}`,
+          ref: { libraryId: lib.id, deckId: d.id } satisfies DeckRef,
+        }))
+      );
+
+      const refreshed: Record<string, DeckOverview> = {};
+      const CHUNK = 25;
+      for (let i = 0; i < pairs.length; i += CHUNK) {
+        const chunk = pairs.slice(i, i + CHUNK);
+        const entries = await Promise.all(
+          chunk.map(async ({ key, ref }) => {
+            try {
+              const ov = await getDeckOverview(ref);
+              return [key, ov] as const;
+            } catch {
+              return null;
+            }
+          })
+        );
+        for (const e of entries) {
+          if (!e) continue;
+          refreshed[e[0]] = e[1];
+        }
+      }
+
+      if (pairs.length > 0) {
+        setDeckOverviews((prev) => ({ ...prev, ...refreshed }));
       }
 
       setPhase("Finalizing sync…");
