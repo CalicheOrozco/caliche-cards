@@ -8,7 +8,7 @@ import {
   verifySessionToken,
   type Session,
   type SessionUser,
-} from "@/lib/auth";
+} from "@/lib/session";
 
 export type JsonError = { error: string };
 

@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { getSessionCookieName, verifySessionToken } from "@/lib/auth";
+import { getSessionCookieName, verifySessionToken } from "@/lib/session";
 
 const PUBLIC_PATHS = new Set<string>(["/login", "/register"]);
 

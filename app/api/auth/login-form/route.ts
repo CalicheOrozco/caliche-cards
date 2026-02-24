@@ -1,7 +1,7 @@
 import { ObjectId } from "mongodb";
 import { NextResponse, type NextRequest } from "next/server";
 
-import { verifyPassword } from "@/lib/auth";
+import { verifyPassword } from "@/lib/password";
 import { getMongoDb } from "@/lib/mongodb";
 import {
   normalizeUsername,
