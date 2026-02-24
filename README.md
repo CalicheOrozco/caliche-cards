@@ -2,6 +2,24 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+### Environment variables
+
+Create `.env.local` (or `.env`) with:
+
+```bash
+MONGODB_URI="<your mongodb connection string>"
+AUTH_SECRET="<long random string>"
+
+# optional
+MONGODB_DB="caliche-cards"
+```
+
+Generate a secure `AUTH_SECRET` (macOS):
+
+```bash
+openssl rand -base64 32
+```
+
 First, run the development server:
 
 ```bash

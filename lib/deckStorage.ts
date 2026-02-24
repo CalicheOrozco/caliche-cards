@@ -71,6 +71,26 @@ export async function loadLastState(): Promise<LoadStateResult> {
   if (value.schemaVersion !== STATE_SCHEMA_VERSION) {
     // Best-effort migration: older versions stored full ImportedDeck including cards.
     try {
+      function parseDeckMetas(input: unknown): Array<{ id: number; name: string }> {
+        if (!input || typeof input !== "object") return [];
+        if (!("decks" in input)) return [];
+        const decksRaw = (input as { decks?: unknown }).decks;
+        if (!Array.isArray(decksRaw)) return [];
+
+        const out: Array<{ id: number; name: string }> = [];
+        for (const d of decksRaw) {
+          if (!d || typeof d !== "object") continue;
+          const idRaw = (d as { id?: unknown }).id;
+          const nameRaw = (d as { name?: unknown }).name;
+          const id = typeof idRaw === "number" ? idRaw : Number(idRaw);
+          const name = typeof nameRaw === "string" ? nameRaw : String(nameRaw ?? "");
+          const trimmed = name.trim();
+          if (!Number.isFinite(id) || trimmed.length === 0) continue;
+          out.push({ id, name: trimmed });
+        }
+        return out;
+      }
+
       const raw = value as unknown as {
         schemaVersion?: number;
         libraries?: Array<{
@@ -90,12 +110,7 @@ export async function loadLastState(): Promise<LoadStateResult> {
           const id = typeof lib.id === "string" ? lib.id : "";
           const name = typeof lib.name === "string" ? lib.name : "Deck";
 
-          const deckAny = lib.deck as any;
-          const decks = Array.isArray(deckAny?.decks)
-            ? deckAny.decks
-                .map((d: any) => ({ id: Number(d?.id), name: String(d?.name ?? "") }))
-                .filter((d: any) => Number.isFinite(d.id) && d.name.trim().length > 0)
-            : [];
+          const decks = parseDeckMetas(lib.deck);
 
           const selectedDeckId =
             typeof lib.selectedDeckId === "number" && Number.isFinite(lib.selectedDeckId)

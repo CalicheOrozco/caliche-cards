@@ -463,6 +463,8 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [authUser, setAuthUser] = useState<{ username: string } | null>(null);
+
   const [libraries, setLibraries] = useState<LibraryItem[]>([]);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
 
@@ -496,6 +498,41 @@ export default function Home() {
         // ignore
       }
     })();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/auth/me", { cache: "no-store" });
+        const data: unknown = await res.json().catch(() => null);
+
+        const user = (() => {
+          if (!data || typeof data !== "object") return null;
+          if (!("user" in data)) return null;
+          const maybeUser = (data as { user?: unknown }).user;
+          if (!maybeUser || typeof maybeUser !== "object") return null;
+          if (!("username" in maybeUser)) return null;
+          const username = (maybeUser as { username?: unknown }).username;
+          return typeof username === "string" ? { username } : null;
+        })();
+
+        if (!cancelled && user) setAuthUser(user);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onLogout = useCallback(async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      window.location.href = "/login";
+    }
   }, []);
 
   const activeLibrary = useMemo(() => {
@@ -924,15 +961,31 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          {libraries.length > 0 ? (
+          <div className="flex items-center gap-2">
+            {authUser ? (
+              <div className="hidden sm:block text-sm text-foreground/70">
+                {authUser.username}
+              </div>
+            ) : null}
+
             <button
               type="button"
               className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
-              onClick={onClearSaved}
+              onClick={onLogout}
             >
-              Clear all
+              Logout
             </button>
-          ) : null}
+
+            {libraries.length > 0 ? (
+              <button
+                type="button"
+                className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                onClick={onClearSaved}
+              >
+                Clear all
+              </button>
+            ) : null}
+          </div>
         </header>
 
         {error ? (
