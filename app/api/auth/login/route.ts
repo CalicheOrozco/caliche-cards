@@ -21,6 +21,8 @@ type UserDoc = {
   createdAt: number;
 };
 
+export const runtime = "nodejs";
+
 export async function POST(req: NextRequest) {
   let body: LoginBody;
   try {

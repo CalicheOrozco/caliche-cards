@@ -18,6 +18,8 @@ type UserDoc = {
   createdAt: number;
 };
 
+export const runtime = "nodejs";
+
 function safeNextPath(input: FormDataEntryValue | null, fallback = "/"): string {
   const raw = typeof input === "string" ? input : "";
   if (!raw) return fallback;

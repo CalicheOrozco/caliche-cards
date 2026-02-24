@@ -18,6 +18,8 @@ type UserDoc = {
   createdAt: number;
 };
 
+export const runtime = "nodejs";
+
 function redirectBack(req: NextRequest, next: string, error: "invalid" | "server") {
   const url = new URL("/login", req.url);
   url.searchParams.set("error", error);

@@ -1,15 +1,21 @@
  
 
-const CACHE_NAME = "caliche-cards-v1";
+// Bump this when changing caching behavior to ensure old caches are dropped.
+const CACHE_NAME = "caliche-cards-v2";
 
 const PRECACHE_URLS = ["/", "/manifest.webmanifest", "/icon", "/apple-icon"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE_NAME)
-      .then((cache) => cache.addAll(PRECACHE_URLS))
-      .then(() => self.skipWaiting())
+    (async () => {
+      try {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.addAll(PRECACHE_URLS);
+      } catch {
+        // If precache fails (redirects, transient network), still install.
+      }
+      await self.skipWaiting();
+    })()
   );
 });
 
@@ -33,6 +39,23 @@ self.addEventListener("fetch", (event) => {
 
   // Avoid caching Next.js RSC/data requests too aggressively.
   const url = new URL(request.url);
+  // Never cache API responses.
+  if (url.pathname.startsWith("/api/")) return;
+
+  // For navigations, prefer network to avoid serving stale HTML across deploys.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      (async () => {
+        try {
+          return await fetch(request);
+        } catch {
+          const cache = await caches.open(CACHE_NAME);
+          return (await cache.match("/")) || Response.error();
+        }
+      })()
+    );
+    return;
+  }
   if (url.pathname.startsWith("/_next/image")) return;
 
   if (url.pathname.startsWith("/_next/static")) {

@@ -2,6 +2,8 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { getSessionFromRequest } from "../_shared";
 
+export const runtime = "nodejs";
+
 export async function GET(req: NextRequest) {
   const session = await getSessionFromRequest(req);
   if (!session) return NextResponse.json({ user: null }, { status: 200 });
