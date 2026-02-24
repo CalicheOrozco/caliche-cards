@@ -886,6 +886,14 @@ export default function Home() {
   // Prevent double autoplay from re-renders; reset when card changes.
   const lastAutoPlayedCardIdRef = useRef<number | null>(null);
 
+  // Auto-sync when finishing a review session (best-effort, silent).
+  const lastAutoSyncKeyRef = useRef<string | null>(null);
+  const pendingAutoSyncKeyRef = useRef<string | null>(null);
+  const prevHadReviewCardRef = useRef(false);
+
+  const onSyncFromCloudRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(onSyncFromCloud);
+  onSyncFromCloudRef.current = onSyncFromCloud;
+
   useEffect(() => {
     (async () => {
       try {
@@ -1546,8 +1554,13 @@ export default function Home() {
     }
   }
 
-  async function onSyncFromCloud() {
-    setError(null);
+  async function onSyncFromCloud(opts?: { silent?: boolean }) {
+    const silent = Boolean(opts?.silent);
+    const reportError = (msg: string) => {
+      if (!silent) setError(msg);
+    };
+
+    if (!silent) setError(null);
     setSyncBusy(true);
     setSyncProgress({ done: 0, total: 1, phase: "Listing cloud decks…" });
     try {
@@ -1558,6 +1571,16 @@ export default function Home() {
         "Cloud list"
       );
       const data: unknown = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        const msg = (() => {
+          if (!data || typeof data !== "object") return null;
+          if (!("error" in data)) return null;
+          const err = (data as { error?: unknown }).error;
+          return typeof err === "string" ? err : null;
+        })();
+        throw new Error(msg ?? "Failed to list cloud decks");
+      }
 
       const libs = (() => {
         if (!data || typeof data !== "object") return [];
@@ -2054,15 +2077,15 @@ export default function Home() {
       advance("Sync complete.");
 
       if (uploadWarnings.length > 0) {
-        setError(uploadWarnings.join("\n"));
+        reportError(uploadWarnings.join("\n"));
       }
 
       if (mergedLibraries.length === 0) {
-        setError("No decks found in cloud.");
+        reportError("No decks found in cloud.");
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Sync failed";
-      setError(msg);
+      reportError(msg);
     } finally {
       setSyncBusy(false);
       setSyncProgress(null);
@@ -2634,10 +2657,10 @@ export default function Home() {
   const currentTimingTag = useMemo(() => {
     if (!current) return null;
     const due = typeof current.state?.due === "number" ? current.state.due : 0;
-    if (!Number.isFinite(due)) return { kind: "due" as const, label: "Due", detail: null };
+    if (!Number.isFinite(due)) return { kind: "due", label: "Due", detail: null };
     const isWaiting = due > nowTs;
     return {
-      kind: (isWaiting ? "waiting" : "due") as const,
+      kind: isWaiting ? "waiting" : "due",
       label: isWaiting ? "Waiting" : "Due",
       detail: isWaiting ? `in ${formatIn(due, nowTs)}` : null,
     };
@@ -2686,6 +2709,38 @@ export default function Home() {
     }
   }, [mode]);
 
+  useEffect(() => {
+    if (mode !== "review") {
+      prevHadReviewCardRef.current = false;
+      pendingAutoSyncKeyRef.current = null;
+      return;
+    }
+
+    const hasCurrent = Boolean(current);
+    const transitionedToDone = !hasCurrent && prevHadReviewCardRef.current;
+    prevHadReviewCardRef.current = hasCurrent;
+
+    if (transitionedToDone && reviewRef) {
+      const bucket = Math.floor(Date.now() / (10 * 60 * 1000));
+      const key = `${reviewRef.libraryId}:${reviewRef.deckId}:${bucket}`;
+      if (lastAutoSyncKeyRef.current !== key) {
+        pendingAutoSyncKeyRef.current = key;
+      }
+    }
+
+    const pendingKey = pendingAutoSyncKeyRef.current;
+    if (!pendingKey) return;
+    if (lastAutoSyncKeyRef.current === pendingKey) {
+      pendingAutoSyncKeyRef.current = null;
+      return;
+    }
+    if (syncBusy || busy || reviewBusy) return;
+
+    lastAutoSyncKeyRef.current = pendingKey;
+    pendingAutoSyncKeyRef.current = null;
+    void onSyncFromCloudRef.current({ silent: true });
+  }, [mode, current, reviewRef, syncBusy, busy, reviewBusy]);
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-5 py-10">
@@ -2712,7 +2767,7 @@ export default function Home() {
             <button
               type="button"
               className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
-              onClick={onSyncFromCloud}
+              onClick={() => void onSyncFromCloud()}
               disabled={syncBusy || busy}
               title={
                 syncBusy && syncProgress
