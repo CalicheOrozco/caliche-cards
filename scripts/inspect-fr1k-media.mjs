@@ -38,30 +38,6 @@ function skipWireValue(bytes, offset, wireType) {
   }
 }
 
-function decodeMediaEntryName(entryBytes) {
-  // MediaEntry: we only need field 1: string name = 1;
-  const decoder = new TextDecoder("utf-8", { fatal: false });
-  let i = 0;
-  while (i < entryBytes.length) {
-    const key = readVarint(entryBytes, i);
-    i = key.offset;
-    const field = key.value >>> 3;
-    const wire = key.value & 0x7;
-
-    if (field === 1 && wire === 2) {
-      const len = readVarint(entryBytes, i);
-      i = len.offset;
-      const end = i + len.value;
-      if (end > entryBytes.length) throw new Error("protobuf string out of bounds");
-      return decoder.decode(entryBytes.subarray(i, end));
-    }
-
-    i = skipWireValue(entryBytes, i, wire);
-    if (i > entryBytes.length) throw new Error("protobuf field out of bounds");
-  }
-  return "";
-}
-
 function decodeMediaEntry(entryBytes) {
   // Observed modern MediaEntry fields:
   // - field 1 (wire 2): string name

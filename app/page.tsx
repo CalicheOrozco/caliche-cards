@@ -12,7 +12,7 @@ import {
   saveLastState,
   type LibraryItem,
 } from "../lib/deckStorage";
-import { clearMedia, getMediaBlob } from "../lib/mediaStorage";
+import { clearMedia, getMediaBlob, saveMediaItems } from "../lib/mediaStorage";
 import { clearApkg, getApkgFile, saveApkgFile } from "../lib/apkgStorage";
 import type { CardStateEntity, DeckConfig, DeckRef, NextCard, ReviewLogEntity } from "../lib/studyTypes";
 import {
@@ -142,10 +142,90 @@ function extractFirstSoundFilename(input: string): string | null {
   return filename || null;
 }
 
+function soundCandidatesFromFilename(raw: string): string[] {
+  const trimmedRaw = String(raw ?? "").trim();
+  if (!trimmedRaw) return [];
+
+  let decoded: string | null = null;
+  try {
+    decoded = decodeURIComponent(trimmedRaw);
+  } catch {
+    decoded = null;
+  }
+
+  const plusAsSpace = trimmedRaw.includes("+")
+    ? trimmedRaw.replace(/\+/g, " ")
+    : null;
+  const decodedPlusAsSpace = decoded && decoded.includes("+")
+    ? decoded.replace(/\+/g, " ")
+    : null;
+
+  return Array.from(
+    new Set(
+      [trimmedRaw, decoded ?? "", plusAsSpace ?? "", decodedPlusAsSpace ?? ""]
+        .map((s) => String(s ?? "").trim())
+        .filter((s) => s.length > 0)
+    )
+  );
+}
+
+const inFlightCloudMediaFetch = new Map<string, Promise<Blob | null>>();
+
+async function downloadMediaBlobFromCloud(
+  libraryId: string,
+  name: string
+): Promise<Blob | null> {
+  const safeLibraryId = String(libraryId ?? "").trim();
+  const safeName = String(name ?? "").trim();
+  if (!safeLibraryId || !safeName) return null;
+
+  const key = `${safeLibraryId}:${safeName}`;
+  const existing = inFlightCloudMediaFetch.get(key);
+  if (existing) return existing;
+
+  const p = (async () => {
+    const ctrl = new AbortController();
+    const t = window.setTimeout(() => ctrl.abort(), 30_000);
+    try {
+      const url = `/api/sync/media/download?libraryId=${encodeURIComponent(
+        safeLibraryId
+      )}&name=${encodeURIComponent(safeName)}`;
+      const res = await fetch(url, { method: "GET", signal: ctrl.signal });
+      if (res.status === 401) return null;
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      if (!blob || blob.size <= 0) return null;
+      return blob;
+    } catch {
+      return null;
+    } finally {
+      window.clearTimeout(t);
+    }
+  })();
+
+  inFlightCloudMediaFetch.set(key, p);
+  try {
+    return await p;
+  } finally {
+    inFlightCloudMediaFetch.delete(key);
+  }
+}
+
 async function tryPlayAudioFilename(
   namespace: string,
   filename: string
 ): Promise<void> {
+  const ensureMediaFromCloud = async (): Promise<boolean> => {
+    const blob = await downloadMediaBlobFromCloud(namespace, filename);
+    if (!blob) return false;
+    try {
+      await saveMediaItems(namespace, [{ name: filename, blob }]);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const ensureMediaFromCachedApkg = async (): Promise<boolean> => {
     // Best-effort: if media wasn't stored (quota/bug), attempt to re-extract it
     // from the locally cached .apkg for this library.
@@ -164,10 +244,12 @@ async function tryPlayAudioFilename(
 
   let blob = await getMediaBlob(namespace, filename);
   if (!blob) {
+    const fromCloud = await ensureMediaFromCloud();
+    if (fromCloud) blob = await getMediaBlob(namespace, filename);
+  }
+  if (!blob) {
     const repaired = await ensureMediaFromCachedApkg();
-    if (repaired) {
-      blob = await getMediaBlob(namespace, filename);
-    }
+    if (repaired) blob = await getMediaBlob(namespace, filename);
   }
   if (!blob) throw new Error("blob not found");
 
@@ -278,6 +360,49 @@ function localMediaCandidatesFromSrc(src: string): string[] {
   return Array.from(new Set(candidates.map((s) => s.trim()).filter(Boolean)));
 }
 
+function extractMediaCandidatesFromHtml(html: string): string[] {
+  const input = String(html ?? "");
+  if (!input) return [];
+
+  const out = new Set<string>();
+
+  // Sound tags: [sound:filename.mp3]
+  {
+    const re = /\[sound:([^\]]+)\]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(input)) !== null) {
+      const raw = String(match[1] ?? "").trim();
+      if (!raw) continue;
+      for (const cand of soundCandidatesFromFilename(raw)) out.add(cand);
+    }
+  }
+
+  // Image tags: <img src="...">
+  {
+    const re = /<img\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(input)) !== null) {
+      const src = String(match[1] ?? match[2] ?? match[3] ?? "").trim();
+      if (!src) continue;
+      for (const cand of localMediaCandidatesFromSrc(src)) out.add(cand);
+    }
+  }
+
+  return Array.from(out);
+}
+
+function extractDeckMediaCandidates(deck: ImportedDeck): string[] {
+  const out = new Set<string>();
+  for (const card of deck.cards) {
+    for (const cand of extractMediaCandidatesFromHtml(card.frontHtml)) out.add(cand);
+    for (const cand of extractMediaCandidatesFromHtml(card.backHtml)) out.add(cand);
+    for (const fieldHtml of card.fieldsHtml) {
+      for (const cand of extractMediaCandidatesFromHtml(fieldHtml)) out.add(cand);
+    }
+  }
+  return Array.from(out);
+}
+
 function preprocessHtmlForLocalImages(html: string): string {
   const input = String(html ?? "");
   if (!input) return input;
@@ -354,6 +479,25 @@ function HtmlWithMedia({
       let missingCount = 0;
 
       let attemptedRepair = false;
+      let attemptedCloud = false;
+
+      const ensureMediaFromCloud = async (name: string): Promise<Blob | null> => {
+        if (attemptedCloud) {
+          // Still allow multiple names, but avoid hammering if user is offline.
+        }
+
+        const blob = await downloadMediaBlobFromCloud(namespace, name);
+        attemptedCloud = true;
+        if (!blob) return null;
+
+        try {
+          await saveMediaItems(namespace, [{ name, blob }]);
+          return blob;
+        } catch {
+          return null;
+        }
+      };
+
       const ensureMediaFromCachedApkg = async (): Promise<boolean> => {
         if (attemptedRepair) return false;
         attemptedRepair = true;
@@ -394,6 +538,16 @@ function HtmlWithMedia({
           }
         }
         if (!blob) {
+          // Try cloud first so media works cross-device.
+          for (const cand of candidates) {
+            const cloudBlob = await ensureMediaFromCloud(cand);
+            if (cloudBlob) {
+              blob = cloudBlob;
+              resolved = cand;
+              break;
+            }
+          }
+
           const repaired = await ensureMediaFromCachedApkg();
           if (repaired) {
             for (const cand of candidates) {
@@ -684,6 +838,108 @@ export default function Home() {
     },
     []
   );
+
+  async function uploadLibraryMediaToCloudNow(args: {
+    libraryId: string;
+    deck: ImportedDeck;
+  }): Promise<void> {
+    const libraryId = String(args.libraryId ?? "").trim();
+    if (!libraryId) return;
+
+    // Best-effort: if user isn't logged in, just skip.
+    const listRes = await fetchWithTimeout(
+      `/api/sync/media/list?libraryId=${encodeURIComponent(libraryId)}`,
+      { cache: "no-store" },
+      30_000,
+      "Media list"
+    );
+
+    if (listRes.status === 401) return;
+    if (!listRes.ok) return;
+
+    const listData: unknown = await listRes.json().catch(() => null);
+    const cloudNames = (() => {
+      if (!listData || typeof listData !== "object") return new Set<string>();
+      if (!("items" in listData)) return new Set<string>();
+      const raw = (listData as { items?: unknown }).items;
+      if (!Array.isArray(raw)) return new Set<string>();
+      const names = raw
+        .map((x) => {
+          if (!x || typeof x !== "object") return null;
+          const name = (x as { name?: unknown }).name;
+          return typeof name === "string" ? name : null;
+        })
+        .filter((x): x is string => Boolean(x));
+      return new Set(names);
+    })();
+
+    const candidates = extractDeckMediaCandidates(args.deck);
+    if (candidates.length === 0) return;
+
+    const toUpload: Array<{ name: string; blob: Blob }> = [];
+    for (const name of candidates) {
+      if (!name) continue;
+      if (cloudNames.has(name)) continue;
+      const blob = await getMediaBlob(libraryId, name);
+      if (!blob) continue;
+      if (blob.size <= 0) continue;
+      toUpload.push({ name, blob });
+    }
+
+    if (toUpload.length === 0) return;
+
+    const MAX_FILES_PER_REQ = 15;
+    const MAX_BYTES_PER_REQ = 8 * 1024 * 1024;
+
+    let batch: Array<{ name: string; blob: Blob }> = [];
+    let batchBytes = 0;
+
+    const flush = async (): Promise<boolean> => {
+      if (batch.length === 0) return true;
+
+      const form = new FormData();
+      form.set("libraryId", libraryId);
+      for (const it of batch) {
+        const type = String(it.blob.type || "application/octet-stream");
+        form.append("file", new File([it.blob], it.name, { type }));
+      }
+
+      const res = await fetchWithTimeout(
+        "/api/sync/media/upload",
+        { method: "POST", body: form },
+        120_000,
+        "Media upload"
+      );
+
+      // If unauthenticated/offline/server error, stop silently.
+      if (res.status === 401) return false;
+      if (!res.ok) return false;
+      batch = [];
+      batchBytes = 0;
+      return true;
+    };
+
+    for (const it of toUpload) {
+      const size = Number(it.blob.size || 0);
+      const wouldOverflowFiles = batch.length >= MAX_FILES_PER_REQ;
+      const wouldOverflowBytes = batchBytes > 0 && batchBytes + size > MAX_BYTES_PER_REQ;
+
+      if (wouldOverflowFiles || wouldOverflowBytes) {
+        const ok = await flush();
+        if (ok === false) return;
+      }
+
+      batch.push(it);
+      batchBytes += size;
+
+      if (batch.length >= MAX_FILES_PER_REQ || batchBytes >= MAX_BYTES_PER_REQ) {
+        const ok = await flush();
+        if (ok === false) return;
+      }
+    }
+
+    await flush();
+  }
 
   async function exportDeckDataFromStudyDb(libraryId: string): Promise<ImportedDeck> {
     const db = getStudyDb();
@@ -1149,6 +1405,15 @@ export default function Home() {
       void (async () => {
         try {
           await uploadDeckDataToCloud({ libraryId: id, name, deck: imported });
+
+          // Best-effort: upload referenced media blobs so other devices can
+          // fetch them on-demand (without uploading the full .apkg).
+          try {
+            await uploadLibraryMediaToCloudNow({ libraryId: id, deck: imported });
+          } catch {
+            // ignore
+          }
+
           const ts = Date.now();
           setLastSyncAt(ts);
           const { state } = await loadLastState();
@@ -1277,6 +1542,15 @@ export default function Home() {
         setPhase(`Uploading “${local.name}”…`);
         await uploadDeckDataFileToCloud({ libraryId: local.id, name: local.name, file });
         advance(`Uploaded “${local.name}”.`);
+
+        // Best-effort: upload media in background (deduped by cloud list).
+        void (async () => {
+          try {
+            await uploadLibraryMediaToCloudNow({ libraryId: local.id, deck });
+          } catch {
+            // ignore
+          }
+        })();
       }
 
       // Download clouds missing locally.

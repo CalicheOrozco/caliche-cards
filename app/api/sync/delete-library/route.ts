@@ -14,6 +14,10 @@ function getBucket(db: Db, bucketName: "apkg" | "deckdata"): GridFSBucket {
   return new GridFSBucket(db, { bucketName });
 }
 
+function getMediaBucket(db: Db): GridFSBucket {
+  return new GridFSBucket(db, { bucketName: "media" });
+}
+
 type DeleteLibraryBody = {
   libraryId: string;
 };
@@ -51,11 +55,12 @@ export async function POST(req: NextRequest) {
 
   const userId = session.user.userId;
 
-  const [libsRes, cardStatesRes, reviewLogsRes, deckConfigsRes] = await Promise.all([
+  const [libsRes, cardStatesRes, reviewLogsRes, deckConfigsRes, mediaRes] = await Promise.all([
     db.collection("cloudLibraries").deleteMany({ userId, libraryId }),
     db.collection("cloudCardStates").deleteMany({ userId, libraryId }),
     db.collection("cloudReviewLogs").deleteMany({ userId, libraryId }),
     db.collection("cloudDeckConfigs").deleteMany({ userId, libraryId }),
+    db.collection("cloudMedia").deleteMany({ userId, libraryId }),
   ]);
 
   let deletedFiles = 0;
@@ -79,6 +84,27 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Also delete extracted media files.
+  {
+    const files = await db
+      .collection<GridFsFileDoc>("media.files")
+      .find({ "metadata.userId": userId, "metadata.libraryId": libraryId })
+      .project({ _id: 1 })
+      .toArray();
+
+    const bucket = getMediaBucket(db);
+    await Promise.all(
+      files.map(async (f) => {
+        try {
+          await bucket.delete(f._id);
+          deletedFiles += 1;
+        } catch {
+          // ignore
+        }
+      })
+    );
+  }
+
   return NextResponse.json(
     {
       ok: true,
@@ -87,6 +113,7 @@ export async function POST(req: NextRequest) {
         cardStates: cardStatesRes.deletedCount ?? 0,
         reviewLogs: reviewLogsRes.deletedCount ?? 0,
         deckConfigs: deckConfigsRes.deletedCount ?? 0,
+        media: mediaRes.deletedCount ?? 0,
         gridFsFiles: deletedFiles,
       },
     },
