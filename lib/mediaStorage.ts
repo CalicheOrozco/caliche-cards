@@ -9,6 +9,10 @@ interface CalicheCardsDb extends DBSchema {
     key: string; // filename (e.g. ENPV_goon_verb.flac)
     value: Blob;
   };
+  apkg: {
+    key: string;
+    value: unknown;
+  };
 }
 
 function makeMediaKey(namespace: string, name: string): string {
@@ -18,13 +22,16 @@ function makeMediaKey(namespace: string, name: string): string {
 }
 
 function getDb() {
-  return openDB<CalicheCardsDb>("caliche-cards", 3, {
+  return openDB<CalicheCardsDb>("caliche-cards", 4, {
     upgrade(db) {
       if (!db.objectStoreNames.contains("state")) {
         db.createObjectStore("state");
       }
       if (!db.objectStoreNames.contains("media")) {
         db.createObjectStore("media");
+      }
+      if (!db.objectStoreNames.contains("apkg")) {
+        db.createObjectStore("apkg");
       }
     },
   });

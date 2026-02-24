@@ -1,44 +1,39 @@
-"use client";
-
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useState } from "react";
 
-export default function RegisterPage() {
-  const router = useRouter();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+type SearchParams = {
+  error?: string | string[];
+  next?: string | string[];
+};
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setBusy(true);
-    try {
-      const res = await fetch("/api/auth/register", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username, password }),
-      });
-      const data: unknown = await res.json().catch(() => null);
-      if (!res.ok) {
-        const errorMsg = (() => {
-          if (!data || typeof data !== "object") return null;
-          if (!("error" in data)) return null;
-          const err = (data as { error?: unknown }).error;
-          return typeof err === "string" ? err : null;
-        })();
-        setError(errorMsg ?? "Registration failed");
-        return;
-      }
-      router.replace("/");
-    } catch {
-      setError("Registration failed");
-    } finally {
-      setBusy(false);
-    }
-  }
+function first(param: string | string[] | undefined): string {
+  if (Array.isArray(param)) return param[0] ?? "";
+  return param ?? "";
+}
+
+function safeNextPath(raw: string): string {
+  if (!raw) return "";
+  if (!raw.startsWith("/")) return "";
+  if (raw.startsWith("//")) return "";
+  return raw;
+}
+
+export default async function RegisterPage({
+  searchParams,
+}: {
+  searchParams?: Promise<SearchParams> | SearchParams;
+}) {
+  const sp = await Promise.resolve(searchParams ?? {});
+
+  const errorParam = first(sp.error);
+  const next = safeNextPath(first(sp.next));
+
+  const error = (() => {
+    if (!errorParam) return null;
+    if (errorParam === "exists") return "Username already exists";
+    if (errorParam === "server") return "Error del servidor. Intenta de nuevo.";
+    // Validation strings are returned as-is.
+    return errorParam;
+  })();
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -57,16 +52,19 @@ export default function RegisterPage() {
         ) : null}
 
         <form
-          onSubmit={onSubmit}
+          method="post"
+          action="/api/auth/register-form"
           className="rounded-3xl border border-foreground/15 bg-background p-5"
         >
           <div className="flex flex-col gap-4">
+            {next ? <input type="hidden" name="next" value={next} /> : null}
+
             <label className="flex flex-col gap-1">
               <span className="text-xs font-medium text-foreground/70">Username</span>
               <input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                name="username"
                 autoComplete="username"
+                required
                 className="h-11 rounded-xl border border-foreground/15 bg-background px-4 text-sm"
               />
               <span className="text-[11px] text-foreground/60">
@@ -77,10 +75,10 @@ export default function RegisterPage() {
             <label className="flex flex-col gap-1">
               <span className="text-xs font-medium text-foreground/70">Password</span>
               <input
+                name="password"
                 type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
                 autoComplete="new-password"
+                required
                 className="h-11 rounded-xl border border-foreground/15 bg-background px-4 text-sm"
               />
               <span className="text-[11px] text-foreground/60">Minimum 8 characters</span>
@@ -88,10 +86,9 @@ export default function RegisterPage() {
 
             <button
               type="submit"
-              disabled={busy}
-              className="h-11 rounded-full bg-foreground px-4 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+              className="h-11 rounded-full bg-foreground px-4 text-sm font-medium text-background hover:opacity-90"
             >
-              {busy ? "Creating…" : "Create account"}
+              Create account
             </button>
 
             <p className="text-sm text-foreground/70">

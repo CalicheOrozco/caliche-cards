@@ -486,7 +486,7 @@ export async function answerCard(
       await db.cardStates.bulkPut(siblingUpdates);
     }
 
-    const log: ReviewLogEntity = {
+    const logBase = {
       libraryId: ref.libraryId,
       deckId: ref.deckId,
       cardId: prev.cardId,
@@ -506,6 +506,33 @@ export async function answerCard(
       nextReps: next.reps,
       prevLapses: prev.lapses,
       nextLapses: next.lapses,
+    };
+
+    const syncKey = [
+      logBase.libraryId,
+      logBase.deckId,
+      logBase.cardId,
+      logBase.noteId,
+      logBase.ts,
+      logBase.result,
+      logBase.prevState,
+      logBase.nextState,
+      logBase.prevDue,
+      logBase.nextDue,
+      logBase.prevIntervalDays,
+      logBase.nextIntervalDays,
+      logBase.prevStepIndex,
+      logBase.nextStepIndex,
+      logBase.prevReps,
+      logBase.nextReps,
+      logBase.prevLapses,
+      logBase.nextLapses,
+      logBase.timeTakenMs ?? "",
+    ].join("|");
+
+    const log: ReviewLogEntity = {
+      ...logBase,
+      syncKey,
     };
 
     await db.reviewLogs.add(log);
@@ -581,4 +608,58 @@ export async function getTodayRemaining(ref: DeckRef): Promise<{ newLeft: number
     newLeft: Math.max(0, cfg.newPerDay - newDone),
     reviewsLeft: Math.max(0, cfg.reviewsPerDay - reviewDone),
   };
+}
+
+export async function resetDeckProgress(ref: DeckRef): Promise<void> {
+  const db = getStudyDb();
+  const now = Date.now();
+
+  await db.transaction("rw", db.cardStates, db.reviewLogs, async () => {
+    const states = await db.cardStates
+      .where("[libraryId+deckId+due]")
+      .between(
+        [ref.libraryId, ref.deckId, 0],
+        [ref.libraryId, ref.deckId, Number.MAX_SAFE_INTEGER],
+        true,
+        true
+      )
+      .toArray();
+
+    const resetStates: CardStateEntity[] = states.map((s) => ({
+      ...s,
+      state: "new",
+      due: 0,
+      intervalDays: 0,
+      ease: DEFAULT_DECK_CONFIG.easeFactor,
+      reps: 0,
+      lapses: 0,
+      stepIndex: 0,
+      suspended: false,
+      buriedUntil: null,
+      lastReview: null,
+      updatedAt: now,
+    }));
+
+    if (resetStates.length > 0) {
+      await db.cardStates.bulkPut(resetStates);
+    }
+
+    const logs = await db.reviewLogs
+      .where("[libraryId+deckId+ts]")
+      .between(
+        [ref.libraryId, ref.deckId, 0],
+        [ref.libraryId, ref.deckId, Number.MAX_SAFE_INTEGER],
+        true,
+        true
+      )
+      .toArray();
+
+    const ids = logs.map((l) => l.id).filter((x): x is number => typeof x === "number" && x > 0);
+    if (ids.length === 0) return;
+
+    const CHUNK = 1000;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      await db.reviewLogs.bulkDelete(ids.slice(i, i + CHUNK));
+    }
+  });
 }

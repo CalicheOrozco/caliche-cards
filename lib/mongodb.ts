@@ -21,17 +21,18 @@ declare global {
 export async function getMongoClient(): Promise<MongoClient> {
   const uri = getMongoUri();
 
-  if (process.env.NODE_ENV === "development") {
-    if (!global._mongoClientPromise || global._mongoClientUri !== uri) {
-      const client = new MongoClient(uri);
-      global._mongoClientPromise = client.connect();
-      global._mongoClientUri = uri;
-    }
-    return global._mongoClientPromise;
+  // Cache the client across hot reloads in dev, and across requests in prod
+  // (important for serverless/edge-like environments to avoid reconnect storms).
+  if (!global._mongoClientPromise || global._mongoClientUri !== uri) {
+    const client = new MongoClient(uri, {
+      serverSelectionTimeoutMS: 10_000,
+      connectTimeoutMS: 10_000,
+    });
+    global._mongoClientPromise = client.connect();
+    global._mongoClientUri = uri;
   }
 
-  const client = new MongoClient(uri);
-  return client.connect();
+  return global._mongoClientPromise;
 }
 
 export async function getMongoDb(): Promise<Db> {

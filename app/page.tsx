@@ -13,22 +13,82 @@ import {
   type LibraryItem,
 } from "../lib/deckStorage";
 import { clearMedia, getMediaBlob } from "../lib/mediaStorage";
-import type { DeckRef, NextCard } from "../lib/studyTypes";
+import { clearApkg, getApkgFile, saveApkgFile } from "../lib/apkgStorage";
+import type { CardStateEntity, DeckConfig, DeckRef, NextCard, ReviewLogEntity } from "../lib/studyTypes";
 import {
   answerCard,
   getDeckConfig,
   getDeckOverview,
   getNextCard,
+  resetDeckProgress,
   setDeckNewPerDay,
   startStudySession,
   upsertImportedDeck,
   type DeckOverview,
 } from "../lib/studyApi";
-import { deleteStudyDb } from "../lib/studyDb";
-import type { DeckConfig } from "../lib/studyTypes";
-import { scheduleAnswer } from "../lib/scheduler";
+import { deleteStudyDb, getStudyDb } from "../lib/studyDb";
+import { DEFAULT_DECK_CONFIG, scheduleAnswer } from "../lib/scheduler";
 
 type Mode = "import" | "review";
+
+type LocalReviewLogRow = Omit<ReviewLogEntity, "syncKey"> & { syncKey?: string };
+type ReviewLogPushPayload = Omit<ReviewLogEntity, "id">;
+type ProgressPullResponse = {
+  ok: boolean;
+  cardStates: CardStateEntity[];
+  reviewLogs: ReviewLogPushPayload[];
+  deckConfigs: Array<{
+    libraryId: string;
+    deckId: number;
+    newPerDay: number;
+    reviewsPerDay: number;
+    updatedAt: number;
+  }>;
+};
+
+function computeReviewLogSyncKey(log: {
+  libraryId: string;
+  deckId: number;
+  cardId: number;
+  noteId: number;
+  ts: number;
+  result: string;
+  timeTakenMs?: number;
+  prevState: string;
+  nextState: string;
+  prevDue: number;
+  nextDue: number;
+  prevIntervalDays: number;
+  nextIntervalDays: number;
+  prevStepIndex: number;
+  nextStepIndex: number;
+  prevReps: number;
+  nextReps: number;
+  prevLapses: number;
+  nextLapses: number;
+}): string {
+  return [
+    log.libraryId,
+    log.deckId,
+    log.cardId,
+    log.noteId,
+    log.ts,
+    log.result,
+    log.prevState,
+    log.nextState,
+    log.prevDue,
+    log.nextDue,
+    log.prevIntervalDays,
+    log.nextIntervalDays,
+    log.prevStepIndex,
+    log.nextStepIndex,
+    log.prevReps,
+    log.nextReps,
+    log.prevLapses,
+    log.nextLapses,
+    log.timeTakenMs ?? "",
+  ].join("|");
+}
 
 function sanitize(html: string) {
   return DOMPurify.sanitize(html, {
@@ -463,7 +523,16 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [authUser, setAuthUser] = useState<{ username: string } | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [syncProgress, setSyncProgress] = useState<
+    | {
+        done: number;
+        total: number;
+        phase: string;
+      }
+    | null
+  >(null);
 
   const [libraries, setLibraries] = useState<LibraryItem[]>([]);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
@@ -494,40 +563,467 @@ export default function Home() {
         if (!state) return;
         setLibraries(state.libraries ?? []);
         setActiveLibraryId(state.activeLibraryId ?? null);
+        setLastSyncAt(state.lastSyncAt ?? null);
       } catch {
         // ignore
       }
     })();
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
+  type DeckDataEnvelopeV1 = {
+    version: 1;
+    deck: ImportedDeck;
+  };
+
+  const fetchWithTimeout = useCallback(
+    async (
+      input: RequestInfo | URL,
+      init: RequestInit | undefined,
+      timeoutMs: number,
+      label: string
+    ): Promise<Response> => {
+      const controller = new AbortController();
+      const existingSignal = init?.signal;
+
+      if (existingSignal) {
+        if (existingSignal.aborted) controller.abort();
+        else {
+          existingSignal.addEventListener("abort", () => controller.abort(), {
+            once: true,
+          });
+        }
+      }
+
+      const id = window.setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const res = await fetch("/api/auth/me", { cache: "no-store" });
-        const data: unknown = await res.json().catch(() => null);
-
-        const user = (() => {
-          if (!data || typeof data !== "object") return null;
-          if (!("user" in data)) return null;
-          const maybeUser = (data as { user?: unknown }).user;
-          if (!maybeUser || typeof maybeUser !== "object") return null;
-          if (!("username" in maybeUser)) return null;
-          const username = (maybeUser as { username?: unknown }).username;
-          return typeof username === "string" ? { username } : null;
-        })();
-
-        if (!cancelled && user) setAuthUser(user);
-      } catch {
-        // ignore
+        return await fetch(input, { ...init, signal: controller.signal });
+      } catch (e: unknown) {
+        const aborted =
+          controller.signal.aborted ||
+          (e instanceof DOMException && e.name === "AbortError");
+        if (aborted) {
+          throw new Error(`${label} timed out. Please try again.`);
+        }
+        throw e;
+      } finally {
+        window.clearTimeout(id);
       }
-    })();
-    return () => {
-      cancelled = true;
+    },
+    []
+  );
+
+  async function exportDeckDataFromStudyDb(libraryId: string): Promise<ImportedDeck> {
+    const db = getStudyDb();
+
+    const [decks, cards] = await Promise.all([
+      db.decks.where("libraryId").equals(libraryId).toArray(),
+      db.cards.where("libraryId").equals(libraryId).toArray(),
+    ]);
+
+    if (decks.length === 0 || cards.length === 0) {
+      throw new Error(
+        "This deck isn't available locally yet. Try opening it once, or re-import the .apkg."
+      );
+    }
+
+    return {
+      decks: decks
+        .map((d) => ({ id: d.deckId, name: d.name }))
+        .sort((a, b) => a.id - b.id),
+      cards: cards
+        .map((c) => ({
+          id: c.cardId,
+          deckId: c.deckId,
+          noteId: c.noteId,
+          frontHtml: c.frontHtml,
+          backHtml: c.backHtml,
+          fieldsHtml: c.fieldsHtml,
+          fieldNames: c.fieldNames,
+        }))
+        .sort((a, b) => a.id - b.id),
+    } satisfies ImportedDeck;
+  }
+
+  async function gzipBytes(bytes: Uint8Array, timeoutMs = 8_000): Promise<Uint8Array | null> {
+    if (typeof CompressionStream === "undefined") return null;
+
+    const compress = async (): Promise<Uint8Array> => {
+      const cs = new CompressionStream("gzip");
+      const writer = cs.writable.getWriter();
+      const copied = new Uint8Array(bytes);
+      await writer.write(copied);
+      await writer.close();
+      const outBuf = await new Response(cs.readable).arrayBuffer();
+      return new Uint8Array(outBuf);
     };
-  }, []);
+
+    try {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return await compress();
+      }
+
+      const timed = await Promise.race<Uint8Array | null>([
+        compress(),
+        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
+      ]);
+
+      return timed;
+    } catch {
+      return null;
+    }
+  }
+
+  async function gunzipBytes(bytes: Uint8Array): Promise<Uint8Array | null> {
+    if (typeof DecompressionStream === "undefined") return null;
+    try {
+      const ds = new DecompressionStream("gzip");
+      const writer = ds.writable.getWriter();
+      const copied = new Uint8Array(bytes);
+      await writer.write(copied);
+      await writer.close();
+      const outBuf = await new Response(ds.readable).arrayBuffer();
+      return new Uint8Array(outBuf);
+    } catch {
+      return null;
+    }
+  }
+
+  async function encodeDeckDataFile(deck: ImportedDeck): Promise<File> {
+    const envelope: DeckDataEnvelopeV1 = { version: 1, deck };
+    const json = JSON.stringify(envelope);
+    const raw = new TextEncoder().encode(json);
+    const gz = await gzipBytes(raw, 8_000);
+
+    if (gz) {
+      const copied = new Uint8Array(gz);
+      return new File([copied], "deck.json.gz", { type: "application/gzip" });
+    }
+
+    const copied = new Uint8Array(raw);
+    return new File([copied], "deck.json", { type: "application/json" });
+  }
+
+  async function uploadDeckDataFileToCloud(args: {
+    libraryId: string;
+    name: string;
+    file: File;
+    _attempt?: number;
+  }): Promise<void> {
+    const form = new FormData();
+    form.set("libraryId", args.libraryId);
+    form.set("name", args.name);
+    form.set("file", args.file);
+
+    const res = await fetchWithTimeout(
+      "/api/sync/upload-deck",
+      {
+        method: "POST",
+        body: form,
+      },
+      120_000,
+      "Upload"
+    );
+
+    if (!res.ok) {
+      const data: unknown = await res.json().catch(() => null);
+      const jsonMsg = (() => {
+        if (!data || typeof data !== "object") return null;
+        if (!("error" in data)) return null;
+        const err = (data as { error?: unknown }).error;
+        return typeof err === "string" ? err : null;
+      })();
+
+      if (jsonMsg) {
+        const attempt = args._attempt ?? 0;
+        const isQuota = /space quota|over your space quota|quota/i.test(jsonMsg);
+        if (isQuota && attempt < 1) {
+          try {
+            await fetch("/api/sync/cleanup", { method: "POST" });
+          } catch {
+            // ignore
+          }
+          await uploadDeckDataFileToCloud({ ...args, _attempt: attempt + 1 });
+          return;
+        }
+
+        throw new Error(jsonMsg);
+      }
+
+      const text = await res.text().catch(() => "");
+      const trimmed = text.trim();
+      const maybeHtml = /^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed);
+      const fallbackDetail = !maybeHtml && trimmed ? trimmed.slice(0, 200) : "";
+
+      throw new Error(
+        `Failed to sync to cloud (HTTP ${res.status})${fallbackDetail ? `: ${fallbackDetail}` : ""}`
+      );
+    }
+  }
+
+  async function decodeDeckDataBlob(blob: Blob): Promise<ImportedDeck> {
+    const ct = (blob.type || "").toLowerCase();
+    const buf = new Uint8Array(await blob.arrayBuffer());
+
+    let jsonText: string;
+    if (ct.includes("gzip") || ct.includes("x-gzip")) {
+      const raw = await gunzipBytes(buf);
+      if (!raw) {
+        throw new Error(
+          "Your browser can't decompress this deck format. Please update your browser or re-import the .apkg on this device."
+        );
+      }
+      jsonText = new TextDecoder().decode(raw);
+    } else {
+      jsonText = new TextDecoder().decode(buf);
+    }
+
+    const parsed: unknown = JSON.parse(jsonText);
+    const deck = (() => {
+      if (parsed && typeof parsed === "object" && "deck" in parsed) {
+        return (parsed as { deck?: unknown }).deck;
+      }
+      return parsed;
+    })();
+
+    if (!deck || typeof deck !== "object") {
+      throw new Error("Invalid deck data");
+    }
+
+    const decksRaw = (deck as { decks?: unknown }).decks;
+    const cardsRaw = (deck as { cards?: unknown }).cards;
+    if (!Array.isArray(decksRaw) || !Array.isArray(cardsRaw)) {
+      throw new Error("Invalid deck data");
+    }
+
+    return deck as ImportedDeck;
+  }
+
+  async function uploadDeckDataToCloud(args: {
+    libraryId: string;
+    name: string;
+    deck: ImportedDeck;
+    _attempt?: number;
+  }): Promise<void> {
+    const file = await encodeDeckDataFile(args.deck);
+
+    await uploadDeckDataFileToCloud({
+      libraryId: args.libraryId,
+      name: args.name,
+      file,
+      _attempt: args._attempt,
+    });
+  }
+
+  const pushDeckConfigToCloudNow = useCallback(
+    async (ref: DeckRef): Promise<void> => {
+      // Best-effort: if user isn't logged in, just skip.
+      const db = getStudyDb();
+      const row = await db.decks.get([ref.libraryId, ref.deckId]);
+      if (!row) return;
+
+      const res = await fetchWithTimeout(
+        "/api/sync/progress/push",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            libraryId: ref.libraryId,
+            deckConfigs: [
+              {
+                libraryId: ref.libraryId,
+                deckId: ref.deckId,
+                newPerDay: row.newPerDay,
+                reviewsPerDay: row.reviewsPerDay,
+                updatedAt: row.updatedAt,
+              },
+            ],
+          }),
+        },
+        30_000,
+        "Cloud update"
+      );
+
+      if (res.status === 401) return;
+      if (!res.ok) {
+        const errData: unknown = await res.json().catch(() => null);
+        const msg = (() => {
+          if (!errData || typeof errData !== "object") return null;
+          if (!("error" in errData)) return null;
+          const err = (errData as { error?: unknown }).error;
+          return typeof err === "string" ? err : null;
+        })();
+        throw new Error(msg ?? "Cloud update failed");
+      }
+    },
+    [fetchWithTimeout]
+  );
+
+  async function uploadLibraryDeckDataToCloudNow(args: {
+    libraryId: string;
+    libraryName: string;
+  }): Promise<void> {
+    let deck: ImportedDeck | null = null;
+    try {
+      deck = await exportDeckDataFromStudyDb(args.libraryId);
+    } catch (e: unknown) {
+      if (isMissingLocalDeckDataError(e)) {
+        deck = await recoverDeckDataFromCachedApkg(args.libraryId);
+      } else {
+        throw e;
+      }
+    }
+
+    if (!deck) {
+      throw new Error(
+        "This deck isn't available locally yet. Re-import the .apkg to restore it."
+      );
+    }
+
+    const file = await encodeDeckDataFile(deck);
+    const res = await fetchWithTimeout(
+      "/api/sync/upload-deck",
+      (() => {
+        const form = new FormData();
+        form.set("libraryId", args.libraryId);
+        form.set("name", args.libraryName);
+        form.set("file", file);
+        return { method: "POST", body: form };
+      })(),
+      120_000,
+      "Upload"
+    );
+
+    if (res.status === 401) return;
+    if (!res.ok) {
+      const data: unknown = await res.json().catch(() => null);
+      const jsonMsg = (() => {
+        if (!data || typeof data !== "object") return null;
+        if (!("error" in data)) return null;
+        const err = (data as { error?: unknown }).error;
+        return typeof err === "string" ? err : null;
+      })();
+      throw new Error(jsonMsg ?? "Failed to upload deck data");
+    }
+  }
+
+  async function deleteLibraryFromCloudNow(libraryId: string): Promise<void> {
+    const res = await fetchWithTimeout(
+      "/api/sync/delete-library",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ libraryId }),
+      },
+      30_000,
+      "Cloud delete"
+    );
+
+    if (res.status === 401) return;
+    if (!res.ok) {
+      const errData: unknown = await res.json().catch(() => null);
+      const msg = (() => {
+        if (!errData || typeof errData !== "object") return null;
+        if (!("error" in errData)) return null;
+        const err = (errData as { error?: unknown }).error;
+        return typeof err === "string" ? err : null;
+      })();
+      throw new Error(msg ?? "Cloud delete failed");
+    }
+  }
+
+  async function importApkgAsLibrary(args: {
+    libraryId: string;
+    libraryName: string;
+    file: File;
+  }): Promise<{ item: LibraryItem; imported: ImportedDeck }> {
+    const { libraryId: id, libraryName: name, file } = args;
+
+    const baseName = file.name.replace(/\.[^.]+$/u, "").trim();
+    const imported = await importApkg(file, { mediaNamespace: id });
+
+    // Cache the original .apkg locally so we can recover/re-upload later if the
+    // study IndexedDB is cleared or partially missing.
+    try {
+      await saveApkgFile({ libraryId: id, file });
+    } catch {
+      // ignore (quota / private mode)
+    }
+
+    // If the export contains exactly one top-level deck, rename it to the
+    // filename (sans extension) so the list matches what you imported.
+    const topLevelDecks = imported.decks.filter((d) => !d.name.includes("::"));
+    const shouldRenameTopLevel = baseName && topLevelDecks.length === 1;
+    const importedWithRenamedTopLevel: ImportedDeck = shouldRenameTopLevel
+      ? {
+          ...imported,
+          decks: imported.decks.map((d) =>
+            d.id === topLevelDecks[0]?.id ? { ...d, name: baseName } : d
+          ),
+        }
+      : imported;
+
+    const defaultDeckId = importedWithRenamedTopLevel.decks[0]?.id ?? null;
+
+    const nextItem: LibraryItem = {
+      id,
+      name,
+      deck: {
+        decks: importedWithRenamedTopLevel.decks.map((d) => ({ id: d.id, name: d.name })),
+      },
+      selectedDeckId: defaultDeckId,
+      savedAt: Date.now(),
+    };
+
+    await upsertImportedDeck(id, importedWithRenamedTopLevel);
+    return { item: nextItem, imported: importedWithRenamedTopLevel };
+  }
+
+  function isMissingLocalDeckDataError(e: unknown): boolean {
+    return (
+      e instanceof Error &&
+      /isn't available locally yet/i.test(e.message)
+    );
+  }
+
+  async function recoverDeckDataFromCachedApkg(libraryId: string): Promise<ImportedDeck | null> {
+    const stored = await getApkgFile(libraryId).catch(() => null);
+    if (!stored) return null;
+
+    const file = new File([stored.blob], stored.filename || "deck.apkg", {
+      type: "application/octet-stream",
+    });
+
+    const imported = await importApkg(file, { mediaNamespace: libraryId });
+    // Re-seed StudyDB to restore local availability.
+    await upsertImportedDeck(libraryId, imported);
+    return imported;
+  }
+
+  async function importDeckDataAsLibrary(args: {
+    libraryId: string;
+    libraryName: string;
+    deck: ImportedDeck;
+  }): Promise<LibraryItem> {
+    const { libraryId: id, libraryName: name, deck } = args;
+
+    const defaultDeckId = deck.decks[0]?.id ?? null;
+    const nextItem: LibraryItem = {
+      id,
+      name,
+      deck: {
+        decks: deck.decks.map((d) => ({ id: d.id, name: d.name })),
+      },
+      selectedDeckId: defaultDeckId,
+      savedAt: Date.now(),
+    };
+
+    await upsertImportedDeck(id, deck);
+    return nextItem;
+  }
 
   const onLogout = useCallback(async () => {
+    const ok = confirm("Are you sure you want to log out?");
+    if (!ok) return;
     try {
       await fetch("/api/auth/logout", { method: "POST" });
     } finally {
@@ -558,35 +1054,11 @@ export default function Home() {
       const baseName = file.name.replace(/\.[^.]+$/u, "").trim();
       const name = baseName || "Deck";
 
-      const imported = await importApkg(file, { mediaNamespace: id });
-
-      // If the export contains exactly one top-level deck, rename it to the
-      // filename (sans extension) so the list matches what you imported.
-      const topLevelDecks = imported.decks.filter((d) => !d.name.includes("::"));
-      const shouldRenameTopLevel = baseName && topLevelDecks.length === 1;
-      const importedWithRenamedTopLevel: ImportedDeck = shouldRenameTopLevel
-        ? {
-            ...imported,
-            decks: imported.decks.map((d) =>
-              d.id === topLevelDecks[0]?.id ? { ...d, name: baseName } : d
-            ),
-          }
-        : imported;
-
-      const defaultDeckId = importedWithRenamedTopLevel.decks[0]?.id ?? null;
-
-      const nextItem: LibraryItem = {
-        id,
-        name,
-        deck: {
-          decks: importedWithRenamedTopLevel.decks.map((d) => ({ id: d.id, name: d.name })),
-        },
-        selectedDeckId: defaultDeckId,
-        savedAt: Date.now(),
-      };
-
-      // Seed scheduler persistence (CardState / logs) for this import.
-      await upsertImportedDeck(id, importedWithRenamedTopLevel);
+      const { item: nextItem, imported } = await importApkgAsLibrary({
+        libraryId: id,
+        libraryName: name,
+        file,
+      });
 
       setLibraries((prev) => {
         const next = [...prev, nextItem];
@@ -599,6 +1071,26 @@ export default function Home() {
       });
 
       setActiveLibraryId(id);
+
+      // Best-effort: persist this deck to the user's cloud DB.
+      void (async () => {
+        try {
+          await uploadDeckDataToCloud({ libraryId: id, name, deck: imported });
+          const ts = Date.now();
+          setLastSyncAt(ts);
+          const { state } = await loadLastState();
+          if (state) {
+            await saveLastState({
+              libraries: state.libraries,
+              activeLibraryId: state.activeLibraryId,
+              savedAt: Date.now(),
+              lastSyncAt: ts,
+            });
+          }
+        } catch {
+          // ignore (offline or server error)
+        }
+      })();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Error importing .apkg";
       setError(msg);
@@ -607,12 +1099,526 @@ export default function Home() {
     }
   }
 
+  async function onSyncFromCloud() {
+    setError(null);
+    setSyncBusy(true);
+    setSyncProgress({ done: 0, total: 1, phase: "Listing cloud decks…" });
+    try {
+      const res = await fetchWithTimeout(
+        "/api/sync/list",
+        { cache: "no-store" },
+        30_000,
+        "Cloud list"
+      );
+      const data: unknown = await res.json().catch(() => null);
+
+      const libs = (() => {
+        if (!data || typeof data !== "object") return [];
+        if (!("libraries" in data)) return [];
+        const raw = (data as { libraries?: unknown }).libraries;
+        if (!Array.isArray(raw)) return [];
+        return raw
+          .map((x) => {
+            if (!x || typeof x !== "object") return null;
+            const libraryId = (x as { libraryId?: unknown }).libraryId;
+            const name = (x as { name?: unknown }).name;
+            const originalFilename = (x as { originalFilename?: unknown }).originalFilename;
+            if (typeof libraryId !== "string" || typeof name !== "string") return null;
+            return {
+              libraryId,
+              name,
+              originalFilename: typeof originalFilename === "string" ? originalFilename : "deck.apkg",
+            };
+          })
+          .filter((x): x is { libraryId: string; name: string; originalFilename: string } => Boolean(x));
+      })();
+
+      const cloudById = new Map(libs.map((l) => [l.libraryId, l] as const));
+      const localById = new Map(libraries.map((l) => [l.id, l] as const));
+
+      const toUpload = libraries.filter((l) => !cloudById.has(l.id));
+      const toDownload = libs.filter((l) => !localById.has(l.libraryId));
+
+      const plannedMergedCount = libraries.length + toDownload.length;
+      const uploadSteps = toUpload.length * 3;
+      const totalSteps =
+        1 + uploadSteps + toDownload.length + plannedMergedCount * 2 + 1;
+
+      setSyncProgress({
+        done: 1,
+        total: Math.max(1, totalSteps),
+        phase: "Syncing decks…",
+      });
+
+      const advance = (phase: string) => {
+        setSyncProgress((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            done: Math.min(prev.total, prev.done + 1),
+            phase,
+          };
+        });
+      };
+
+      const setPhase = (phase: string) => {
+        setSyncProgress((prev) => (prev ? { ...prev, phase } : prev));
+      };
+
+      // Upload locals missing in cloud.
+      const uploadWarnings: string[] = [];
+      for (const local of toUpload) {
+        setPhase(`Exporting “${local.name}”…`);
+
+        let deck: ImportedDeck | null = null;
+        try {
+          deck = await exportDeckDataFromStudyDb(local.id);
+        } catch (e: unknown) {
+          if (isMissingLocalDeckDataError(e)) {
+            setPhase(`Recovering “${local.name}” from cached .apkg…`);
+            deck = await recoverDeckDataFromCachedApkg(local.id);
+            if (!deck) {
+              uploadWarnings.push(
+                `“${local.name}” couldn't upload because the deck data isn't stored locally on this device. Re-import the .apkg to restore it.`
+              );
+            }
+          } else {
+            throw e;
+          }
+        }
+
+        if (!deck) {
+          // Keep progress consistent with the planned 3 steps for upload.
+          advance(`Skipped “${local.name}” export.`);
+          advance(`Skipped “${local.name}” encoding.`);
+          advance(`Skipped “${local.name}” upload.`);
+          continue;
+        }
+
+        advance(`Exported “${local.name}”.`);
+
+        setPhase(`Encoding “${local.name}”…`);
+        const file = await encodeDeckDataFile(deck);
+        advance(`Encoded “${local.name}”.`);
+
+        setPhase(`Uploading “${local.name}”…`);
+        await uploadDeckDataFileToCloud({ libraryId: local.id, name: local.name, file });
+        advance(`Uploaded “${local.name}”.`);
+      }
+
+      // Download clouds missing locally.
+      const importedItems: LibraryItem[] = [];
+      for (const lib of toDownload) {
+        setPhase(`Downloading “${lib.name}”…`);
+        // Prefer the extracted "deck data" format (smaller than uploading full .apkg).
+        const dlDeck = await fetchWithTimeout(
+          `/api/sync/download-deck?libraryId=${encodeURIComponent(lib.libraryId)}`,
+          { cache: "no-store" },
+          120_000,
+          "Deck download"
+        );
+
+        if (dlDeck.ok) {
+          const blob = await dlDeck.blob();
+          const deck = await decodeDeckDataBlob(blob);
+          const item = await importDeckDataAsLibrary({
+            libraryId: lib.libraryId,
+            libraryName: lib.name,
+            deck,
+          });
+          importedItems.push(item);
+          advance(`Downloaded “${lib.name}”.`);
+          continue;
+        }
+
+        // Back-compat: older cloud entries store only the .apkg.
+        if (dlDeck.status !== 404) {
+          const errData: unknown = await dlDeck.json().catch(() => null);
+          const msg = (() => {
+            if (!errData || typeof errData !== "object") return null;
+            if (!("error" in errData)) return null;
+            const err = (errData as { error?: unknown }).error;
+            return typeof err === "string" ? err : null;
+          })();
+          throw new Error(msg ?? "Failed to download deck");
+        }
+
+        const dlApkg = await fetchWithTimeout(
+          `/api/sync/download?libraryId=${encodeURIComponent(lib.libraryId)}`,
+          { cache: "no-store" },
+          180_000,
+          "APKG download"
+        );
+        if (!dlApkg.ok) {
+          const errData: unknown = await dlApkg.json().catch(() => null);
+          const msg = (() => {
+            if (!errData || typeof errData !== "object") return null;
+            if (!("error" in errData)) return null;
+            const err = (errData as { error?: unknown }).error;
+            return typeof err === "string" ? err : null;
+          })();
+          throw new Error(msg ?? "Failed to download deck");
+        }
+
+        const blob = await dlApkg.blob();
+        const file = new File([blob], lib.originalFilename, {
+          type: "application/octet-stream",
+        });
+
+        const { item, imported } = await importApkgAsLibrary({
+          libraryId: lib.libraryId,
+          libraryName: lib.name,
+          file,
+        });
+        importedItems.push(item);
+
+        // Best-effort: migrate this cloud deck to the smaller deck-data format.
+        void (async () => {
+          try {
+            await uploadDeckDataToCloud({ libraryId: lib.libraryId, name: lib.name, deck: imported });
+          } catch {
+            // ignore
+          }
+        })();
+
+        advance(`Downloaded “${lib.name}”.`);
+      }
+
+      const mergedLibraries = [...libraries, ...importedItems];
+      setLibraries(mergedLibraries);
+
+      if (!activeLibraryId && mergedLibraries.length > 0) {
+        setActiveLibraryId(mergedLibraries[0]?.id ?? null);
+      }
+
+      // Sync study progress (card states + review logs) bidirectionally.
+      const since = lastSyncAt ?? 0;
+      const db = getStudyDb();
+      const MAX_TS = Number.MAX_SAFE_INTEGER;
+
+      for (const lib of mergedLibraries) {
+        setPhase(`Preparing progress for “${lib.name}”…`);
+        // Pull deckIds from local metadata for efficient IndexedDB queries.
+        const deckIds = lib.deck?.decks?.map((d) => d.id) ?? [];
+
+        const deckConfigs = await db.decks
+          .where("[libraryId+updatedAt]")
+          .between([lib.id, since], [lib.id, MAX_TS], false, true)
+          .toArray();
+
+        const cardStates = await db.cardStates
+          .where("[libraryId+updatedAt]")
+          .between([lib.id, since], [lib.id, MAX_TS], false, true)
+          .toArray();
+
+        const reviewLogs: LocalReviewLogRow[] = [];
+        for (const deckId of deckIds) {
+          const batch = await db.reviewLogs
+            .where("[libraryId+deckId+ts]")
+            .between([lib.id, deckId, since], [lib.id, deckId, MAX_TS], false, true)
+            .toArray();
+          reviewLogs.push(...(batch as unknown as LocalReviewLogRow[]));
+        }
+
+        // Best-effort: backfill missing syncKey for older local logs.
+        const logsWithSyncKey = reviewLogs.map((l) => {
+          const hadSyncKey = typeof l.syncKey === "string" && l.syncKey;
+          const syncKey = hadSyncKey
+            ? l.syncKey
+            : computeReviewLogSyncKey({
+                  libraryId: l.libraryId,
+                  deckId: l.deckId,
+                  cardId: l.cardId,
+                  noteId: l.noteId,
+                  ts: l.ts,
+                  result: l.result,
+                  timeTakenMs: l.timeTakenMs,
+                  prevState: l.prevState,
+                  nextState: l.nextState,
+                  prevDue: l.prevDue,
+                  nextDue: l.nextDue,
+                  prevIntervalDays: l.prevIntervalDays,
+                  nextIntervalDays: l.nextIntervalDays,
+                  prevStepIndex: l.prevStepIndex,
+                  nextStepIndex: l.nextStepIndex,
+                  prevReps: l.prevReps,
+                  nextReps: l.nextReps,
+                  prevLapses: l.prevLapses,
+                  nextLapses: l.nextLapses,
+                });
+          return { ...l, syncKey, hadSyncKey } as LocalReviewLogRow & { syncKey: string; hadSyncKey: boolean };
+        });
+
+        const reviewLogsForPush: ReviewLogPushPayload[] = logsWithSyncKey.map((l) => ({
+          syncKey: l.syncKey,
+          libraryId: l.libraryId,
+          deckId: l.deckId,
+          cardId: l.cardId,
+          noteId: l.noteId,
+          ts: l.ts,
+          result: l.result,
+          timeTakenMs: l.timeTakenMs,
+          prevState: l.prevState,
+          nextState: l.nextState,
+          prevDue: l.prevDue,
+          nextDue: l.nextDue,
+          prevIntervalDays: l.prevIntervalDays,
+          nextIntervalDays: l.nextIntervalDays,
+          prevStepIndex: l.prevStepIndex,
+          nextStepIndex: l.nextStepIndex,
+          prevReps: l.prevReps,
+          nextReps: l.nextReps,
+          prevLapses: l.prevLapses,
+          nextLapses: l.nextLapses,
+        }));
+
+        // Persist backfilled keys so future sync is fast/dedupable.
+        await db.transaction("rw", db.reviewLogs, async () => {
+          const toUpdate = logsWithSyncKey
+            .filter((l) => !l.hadSyncKey)
+            .filter((l) => typeof l.id === "number" && l.id > 0);
+          if (toUpdate.length === 0) return;
+          await Promise.all(
+            toUpdate.map((l) => db.reviewLogs.update(l.id as number, { syncKey: l.syncKey }))
+          );
+        });
+
+        // Push local changes to cloud.
+        setPhase(`Pushing progress for “${lib.name}”…`);
+        const pushRes = await fetchWithTimeout(
+          "/api/sync/progress/push",
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              libraryId: lib.id,
+              cardStates,
+              reviewLogs: reviewLogsForPush,
+              deckConfigs: deckConfigs.map((d) => ({
+                libraryId: d.libraryId,
+                deckId: d.deckId,
+                newPerDay: d.newPerDay,
+                reviewsPerDay: d.reviewsPerDay,
+                updatedAt: d.updatedAt,
+              })),
+            }),
+          },
+          120_000,
+          "Progress push"
+        );
+
+        if (!pushRes.ok) {
+          const errData: unknown = await pushRes.json().catch(() => null);
+          const msg = (() => {
+            if (!errData || typeof errData !== "object") return null;
+            if (!("error" in errData)) return null;
+            const err = (errData as { error?: unknown }).error;
+            return typeof err === "string" ? err : null;
+          })();
+          throw new Error(msg ?? "Failed to sync progress to cloud");
+        }
+
+        advance(`Pushed progress for “${lib.name}”.`);
+
+        // Pull remote changes since last sync.
+        setPhase(`Pulling progress for “${lib.name}”…`);
+        const pullRes = await fetchWithTimeout(
+          `/api/sync/progress/pull?libraryId=${encodeURIComponent(lib.id)}&since=${encodeURIComponent(
+            String(since)
+          )}`,
+          { cache: "no-store" },
+          120_000,
+          "Progress pull"
+        );
+
+        if (!pullRes.ok) {
+          const errData: unknown = await pullRes.json().catch(() => null);
+          const msg = (() => {
+            if (!errData || typeof errData !== "object") return null;
+            if (!("error" in errData)) return null;
+            const err = (errData as { error?: unknown }).error;
+            return typeof err === "string" ? err : null;
+          })();
+          throw new Error(msg ?? "Failed to sync progress from cloud");
+        }
+
+        const pullData: unknown = await pullRes.json().catch(() => null);
+        const remoteCardStates: CardStateEntity[] = (() => {
+          if (!pullData || typeof pullData !== "object") return [];
+          const raw = (pullData as Partial<ProgressPullResponse>).cardStates;
+          return Array.isArray(raw) ? (raw as CardStateEntity[]) : [];
+        })();
+        const remoteReviewLogs: ReviewLogPushPayload[] = (() => {
+          if (!pullData || typeof pullData !== "object") return [];
+          const raw = (pullData as Partial<ProgressPullResponse>).reviewLogs;
+          return Array.isArray(raw) ? (raw as ReviewLogPushPayload[]) : [];
+        })();
+
+        const remoteDeckConfigs: ProgressPullResponse["deckConfigs"] = (() => {
+          if (!pullData || typeof pullData !== "object") return [];
+          const raw = (pullData as Partial<ProgressPullResponse>).deckConfigs;
+          return Array.isArray(raw) ? (raw as ProgressPullResponse["deckConfigs"]) : [];
+        })();
+
+        const changedConfigDeckIds = new Set<number>();
+
+        await db.transaction("rw", db.decks, db.cardStates, db.reviewLogs, async () => {
+          if (remoteDeckConfigs.length > 0) {
+            for (const cfg of remoteDeckConfigs) {
+              if (!cfg || cfg.libraryId !== lib.id) continue;
+              const deckId = typeof cfg.deckId === "number" ? cfg.deckId : Number(cfg.deckId);
+              const updatedAt = typeof cfg.updatedAt === "number" ? cfg.updatedAt : Number(cfg.updatedAt);
+              if (!Number.isFinite(deckId) || deckId <= 0) continue;
+              if (!Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+
+              const local = await db.decks.get([lib.id, deckId]);
+              const localUpdated = local?.updatedAt ?? 0;
+              if (updatedAt <= localUpdated) continue;
+
+              const name =
+                local?.name ??
+                (lib.deck?.decks?.find((d) => d.id === deckId)?.name ?? "");
+
+              await db.decks.put({
+                libraryId: lib.id,
+                deckId,
+                name,
+                newPerDay: Math.max(0, Math.floor(Number(cfg.newPerDay) || 0)),
+                reviewsPerDay: Math.max(0, Math.floor(Number(cfg.reviewsPerDay) || 0)),
+                createdAt: local?.createdAt ?? updatedAt,
+                updatedAt,
+              });
+
+              changedConfigDeckIds.add(deckId);
+            }
+          }
+
+          if (remoteCardStates.length > 0) {
+            const keys = remoteCardStates.map((s) => [s.libraryId, s.cardId] as [string, number]);
+            const existing = await db.cardStates.bulkGet(keys);
+            const toPut: CardStateEntity[] = [];
+            for (let i = 0; i < remoteCardStates.length; i += 1) {
+              const remote = remoteCardStates[i];
+              const local = existing[i] ?? null;
+              if (!local || (typeof remote.updatedAt === "number" && remote.updatedAt > (local.updatedAt ?? 0))) {
+                toPut.push(remote);
+              }
+            }
+            if (toPut.length > 0) await db.cardStates.bulkPut(toPut);
+          }
+
+          if (remoteReviewLogs.length > 0) {
+            const remote = remoteReviewLogs
+              .map((l) => ({
+                ...l,
+                syncKey:
+                  typeof l.syncKey === "string" && l.syncKey
+                    ? l.syncKey
+                    : computeReviewLogSyncKey(l),
+              }))
+              .filter((l) => l.libraryId === lib.id);
+
+            const CHUNK = 500;
+            const toAdd: ReviewLogPushPayload[] = [];
+
+            for (let i = 0; i < remote.length; i += CHUNK) {
+              const chunk = remote.slice(i, i + CHUNK);
+              const keys = chunk.map((l) => [lib.id, l.syncKey] as [string, string]);
+              const existing = await db.reviewLogs
+                .where("[libraryId+syncKey]")
+                .anyOf(keys)
+                .toArray();
+              const existingKeys = new Set(existing.map((e) => String(e.syncKey ?? "")));
+
+              for (const l of chunk) {
+                if (!existingKeys.has(l.syncKey)) toAdd.push(l);
+              }
+            }
+
+            if (toAdd.length > 0) {
+              await db.reviewLogs.bulkAdd(toAdd);
+            }
+          }
+        });
+
+        // Refresh cached UI overview for changed deck configs.
+        if (changedConfigDeckIds.size > 0) {
+          setPhase(`Applying deck settings for “${lib.name}”…`);
+          const refs = Array.from(changedConfigDeckIds).map((deckId) => ({
+            libraryId: lib.id,
+            deckId,
+          }));
+
+          const overviews = await Promise.all(
+            refs.map(async (ref) => {
+              try {
+                const ov = await getDeckOverview(ref);
+                return [ref, ov] as const;
+              } catch {
+                return null;
+              }
+            })
+          );
+
+          setDeckOverviews((prev) => {
+            const next = { ...prev };
+            for (const entry of overviews) {
+              if (!entry) continue;
+              const key = `${entry[0].libraryId}:${entry[0].deckId}`;
+              next[key] = entry[1];
+            }
+            return next;
+          });
+
+          if (reviewRef && reviewRef.libraryId === lib.id && changedConfigDeckIds.has(reviewRef.deckId)) {
+            try {
+              const cfg = await getDeckConfig(reviewRef);
+              setReviewDeckConfig(cfg);
+            } catch {
+              // ignore
+            }
+          }
+        }
+
+        advance(`Pulled progress for “${lib.name}”.`);
+      }
+
+      setPhase("Finalizing sync…");
+      const ts = Date.now();
+      setLastSyncAt(ts);
+      await saveLastState({
+        libraries: mergedLibraries,
+        activeLibraryId: activeLibraryId ?? (mergedLibraries[0]?.id ?? null),
+        savedAt: Date.now(),
+        lastSyncAt: ts,
+      });
+
+      advance("Sync complete.");
+
+      if (uploadWarnings.length > 0) {
+        setError(uploadWarnings.join("\n"));
+      }
+
+      if (mergedLibraries.length === 0) {
+        setError("No decks found in cloud.");
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Sync failed";
+      setError(msg);
+    } finally {
+      setSyncBusy(false);
+      setSyncProgress(null);
+    }
+  }
+
   async function onClearSaved() {
     await clearLastState();
     await clearMedia();
+    await clearApkg();
     await deleteStudyDb();
     setLibraries([]);
     setActiveLibraryId(null);
+    setLastSyncAt(null);
     setMode("import");
     setShowAnswer(false);
     setReviewRef(null);
@@ -635,6 +1641,13 @@ export default function Home() {
     async (libraryId: string, deckId: number, raw: string) => {
       const next = Number(raw);
       await setDeckNewPerDay({ libraryId, deckId }, next);
+
+      // Push deck config to cloud immediately (no Sync button).
+      try {
+        await pushDeckConfigToCloudNow({ libraryId, deckId });
+      } catch {
+        setError("Updated locally, but failed to update cloud settings.");
+      }
 
       // Optimistically reflect in UI even if overview refresh lags.
       setDeckOverviews((prev) => {
@@ -662,7 +1675,7 @@ export default function Home() {
         setReviewDeckConfig(cfg);
       }
     },
-    [reviewRef]
+    [reviewRef, pushDeckConfigToCloudNow]
   );
 
   useEffect(() => {
@@ -764,9 +1777,37 @@ export default function Home() {
         ),
       },
     }));
+
+    // Persist rename in StudyDB and upload updated deckdata to cloud.
+    void (async () => {
+      try {
+        const now = Date.now();
+        const db = getStudyDb();
+        const updated = await db.decks.update([libraryId, deckId], {
+          name: trimmed,
+          updatedAt: now,
+        });
+        if (updated === 0) {
+          await db.decks.put({
+            libraryId,
+            deckId,
+            name: trimmed,
+            newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
+            reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+
+        const libName = libraries.find((l) => l.id === libraryId)?.name ?? "Deck";
+        await uploadLibraryDeckDataToCloudNow({ libraryId, libraryName: libName });
+      } catch {
+        setError("Renamed locally, but failed to update cloud deck data.");
+      }
+    })();
   }
 
-  function deleteDeck(libraryId: string, deckId: number) {
+  async function deleteDeck(libraryId: string, deckId: number) {
     const lib = libraries.find((l) => l.id === libraryId);
     if (!lib) return;
     const deck = lib.deck.decks.find((d) => d.id === deckId);
@@ -780,20 +1821,187 @@ export default function Home() {
       lib.deck.decks.filter((d) => toDeleteNames.has(d.name)).map((d) => d.id)
     );
 
-    updateLibrary(libraryId, (item) => {
-      const nextDecks = item.deck.decks.filter((d) => !toDeleteIds.has(d.id));
-      const nextSelected =
-        item.selectedDeckId != null && toDeleteIds.has(item.selectedDeckId)
-          ? (nextDecks[0]?.id ?? null)
-          : item.selectedDeckId;
+    const remainingDecks = lib.deck.decks.filter((d) => !toDeleteIds.has(d.id));
 
-      return {
-        ...item,
-        selectedDeckId: nextSelected,
-        deck: { decks: nextDecks },
-      };
-    });
+    setError(null);
+    setBusy(true);
+    try {
+      const ids = Array.from(toDeleteIds);
+      const db = getStudyDb();
+
+      // Delete all study DB rows tied to these deckIds.
+      await db.transaction("rw", db.decks, db.cards, db.cardStates, db.reviewLogs, async () => {
+        // Cards + states
+        const cardKeysToDelete: Array<[string, number]> = [];
+        for (const id of ids) {
+          const cards = await db.cards
+            .where("[libraryId+deckId]")
+            .equals([libraryId, id])
+            .toArray();
+
+          for (const c of cards) {
+            cardKeysToDelete.push([libraryId, c.cardId]);
+          }
+        }
+
+        if (cardKeysToDelete.length > 0) {
+          await Promise.all([
+            db.cardStates.bulkDelete(cardKeysToDelete),
+            db.cards.bulkDelete(cardKeysToDelete),
+          ]);
+        }
+
+        // Review logs (primary key is auto-incremented numeric id)
+        for (const id of ids) {
+          const logs = await db.reviewLogs
+            .where("[libraryId+deckId+ts]")
+            .between(
+              [libraryId, id, 0],
+              [libraryId, id, Number.MAX_SAFE_INTEGER],
+              true,
+              true
+            )
+            .toArray();
+          const logIds = logs
+            .map((l) => l.id)
+            .filter((x): x is number => typeof x === "number");
+          if (logIds.length > 0) {
+            await db.reviewLogs.bulkDelete(logIds);
+          }
+        }
+
+        // Deck rows
+        await db.decks.bulkDelete(ids.map((id) => [libraryId, id] as [string, number]));
+      });
+
+      // If the currently open review deck got deleted, exit review to avoid inconsistent state.
+      if (reviewRef && reviewRef.libraryId === libraryId && toDeleteIds.has(reviewRef.deckId)) {
+        setMode("import");
+        setShowAnswer(false);
+        setReviewRef(null);
+        setCurrent(null);
+        setReviewOverview(null);
+      }
+
+      // Update UI + persisted state.
+      updateLibrary(libraryId, (item) => {
+        const nextDecks = item.deck.decks.filter((d) => !toDeleteIds.has(d.id));
+        const nextSelected =
+          item.selectedDeckId != null && toDeleteIds.has(item.selectedDeckId)
+            ? (nextDecks[0]?.id ?? null)
+            : item.selectedDeckId;
+
+        return {
+          ...item,
+          selectedDeckId: nextSelected,
+          deck: { decks: nextDecks },
+        };
+      });
+
+      // Remove cached overviews for deleted decks.
+      setDeckOverviews((prev) => {
+        const next = { ...prev };
+        for (const id of toDeleteIds) {
+          delete next[`${libraryId}:${id}`];
+        }
+        return next;
+      });
+
+      // Best-effort: reflect deletes in cloud.
+      try {
+        for (const id of Array.from(toDeleteIds)) {
+          const res = await fetchWithTimeout(
+            "/api/sync/progress/reset",
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ libraryId, deckId: id }),
+            },
+            30_000,
+            "Cloud reset"
+          );
+          if (res.status !== 401 && !res.ok) throw new Error("Cloud reset failed");
+        }
+
+        if (remainingDecks.length === 0) {
+          await deleteLibraryFromCloudNow(libraryId);
+        } else {
+          // Upload updated deck data (deck list + cards) so other devices stop seeing deleted decks.
+          await uploadLibraryDeckDataToCloudNow({ libraryId, libraryName: lib.name });
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Cloud update failed";
+        setError(`Deleted locally, but failed to update cloud. (${msg})`);
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to delete deck";
+      setError(msg);
+    } finally {
+      setBusy(false);
+    }
   }
+
+  const onResetDeckProgress = useCallback(
+    async (args: { libraryId: string; deckId: number; deckName: string }) => {
+      const { libraryId, deckId, deckName } = args;
+      const ok = confirm(
+        `Reset progress for “${deckName}”?\n\nThis will clear scheduling and review history for this deck.`
+      );
+      if (!ok) return;
+
+      setError(null);
+      setBusy(true);
+      try {
+        await resetDeckProgress({ libraryId, deckId });
+
+        // Best-effort: reset in cloud so it doesn't reappear on other devices.
+        try {
+          const res = await fetchWithTimeout(
+            "/api/sync/progress/reset",
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ libraryId, deckId }),
+            },
+            30_000,
+            "Cloud reset"
+          );
+          if (!res.ok) {
+            const errData: unknown = await res.json().catch(() => null);
+            const msg = (() => {
+              if (!errData || typeof errData !== "object") return null;
+              if (!("error" in errData)) return null;
+              const err = (errData as { error?: unknown }).error;
+              return typeof err === "string" ? err : null;
+            })();
+            throw new Error(msg ?? "Cloud reset failed");
+          }
+        } catch {
+          setError(
+            "Progress was reset locally, but cloud reset failed. Sync on another device may still show old progress."
+          );
+        }
+
+        const ov = await getDeckOverview({ libraryId, deckId });
+        setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
+
+        if (reviewRef?.libraryId === libraryId && reviewRef.deckId === deckId) {
+          // Exit review to avoid inconsistent state.
+          setMode("import");
+          setShowAnswer(false);
+          setReviewRef(null);
+          setCurrent(null);
+          setReviewOverview(null);
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Failed to reset progress";
+        setError(msg);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [reviewRef, fetchWithTimeout]
+  );
 
   async function loadNext(ref: DeckRef, excludeCardId?: number) {
     const [next, ov] = await Promise.all([
@@ -952,7 +2160,7 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-5 py-10">
-        <header className="flex items-center justify-between gap-4">
+        <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">
               Caliche Cards
@@ -961,16 +2169,43 @@ export default function Home() {
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {authUser ? (
-              <div className="hidden sm:block text-sm text-foreground/70">
-                {authUser.username}
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+              Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
+            </div>
+
+            {syncBusy && syncProgress ? (
+              <div className="max-w-55 truncate text-xs text-foreground/60" title={syncProgress.phase}>
+                {syncProgress.phase}
               </div>
             ) : null}
 
             <button
               type="button"
-              className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+              className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+              onClick={onSyncFromCloud}
+              disabled={syncBusy || busy}
+              title={
+                syncBusy && syncProgress
+                  ? syncProgress.phase
+                  : "Download your decks from the cloud and rebuild local storage"
+              }
+            >
+              {(() => {
+                if (!syncBusy) return "Sync";
+                const total = syncProgress?.total ?? 1;
+                const done = syncProgress?.done ?? 0;
+                const pct = Math.max(
+                  0,
+                  Math.min(100, Math.floor((done / Math.max(1, total)) * 100))
+                );
+                return `Syncing… ${pct}%`;
+              })()}
+            </button>
+
+            <button
+              type="button"
+              className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
               onClick={onLogout}
             >
               Logout
@@ -979,7 +2214,7 @@ export default function Home() {
             {libraries.length > 0 ? (
               <button
                 type="button"
-                className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                className="rounded-full border border-foreground/15 px-4 py-2 text-sm text-foreground/70 hover:bg-foreground/5 hover:text-foreground"
                 onClick={onClearSaved}
               >
                 Clear all
@@ -1255,11 +2490,27 @@ export default function Home() {
                                     className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-500 hover:bg-foreground/5"
                                     onClick={() => {
                                       setOpenDeckMenu(null);
+                                      void onResetDeckProgress({
+                                        libraryId: lib.id,
+                                        deckId: d.id,
+                                        deckName: d.name,
+                                      });
+                                    }}
+                                    disabled={busy}
+                                  >
+                                    Reset progress
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-500 hover:bg-foreground/5"
+                                    onClick={() => {
+                                      setOpenDeckMenu(null);
                                       const ok = confirm(
                                         `Delete “${d.name}” and its subdecks?`
                                       );
                                       if (!ok) return;
-                                      deleteDeck(lib.id, d.id);
+                                      void deleteDeck(lib.id, d.id);
                                     }}
                                   >
                                     Delete

@@ -27,6 +27,17 @@ export class StudyDb extends Dexie {
       reviewLogs:
         "++id, [libraryId+deckId+ts], [libraryId+cardId+ts], libraryId, deckId, cardId, ts",
     });
+
+    // v2: add indexes for cloud progress sync
+    this.version(2).stores({
+      decks: "[libraryId+deckId], [libraryId+updatedAt], libraryId, deckId, updatedAt",
+      cards:
+        "[libraryId+cardId], [libraryId+deckId], [libraryId+noteId], libraryId, deckId, noteId",
+      cardStates:
+        "[libraryId+cardId], [libraryId+deckId+state+due], [libraryId+deckId+due], [libraryId+noteId], [libraryId+updatedAt], libraryId, deckId, state, due, updatedAt, suspended, buriedUntil",
+      reviewLogs:
+        "++id, [libraryId+deckId+ts], [libraryId+cardId+ts], [libraryId+syncKey], libraryId, deckId, cardId, ts, syncKey",
+    });
   }
 }
 

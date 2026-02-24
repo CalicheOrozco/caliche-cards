@@ -91,6 +91,10 @@ export type CardStateEntity = {
 export type ReviewLogEntity = {
   id?: number;
 
+  // Stable id used for cloud sync deduplication.
+  // (The local primary key is auto-incremented and device-specific.)
+  syncKey: string;
+
   libraryId: string;
   deckId: number;
   cardId: number;

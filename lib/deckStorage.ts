@@ -1,6 +1,6 @@
 import { openDB, type DBSchema } from "idb";
 
-const STATE_SCHEMA_VERSION = 7;
+const STATE_SCHEMA_VERSION = 8;
 
 export type StoredDeckMeta = {
   decks: Array<{ id: number; name: string }>;
@@ -18,10 +18,16 @@ type StoredState = {
   schemaVersion: number;
   libraries: LibraryItem[];
   activeLibraryId: string | null;
+  lastSyncAt: number | null;
   savedAt: number;
 };
 
-type StoredStateInput = Omit<StoredState, "schemaVersion">;
+type StoredStateInput = {
+  libraries: LibraryItem[];
+  activeLibraryId: string | null;
+  savedAt: number;
+  lastSyncAt?: number | null;
+};
 
 export type LoadStateResult = {
   state: StoredState | null;
@@ -37,16 +43,28 @@ interface CalicheCardsDb extends DBSchema {
     key: string;
     value: Blob;
   };
+  apkg: {
+    key: string; // libraryId
+    value: {
+      blob: Blob;
+      filename: string;
+      size: number;
+      savedAt: number;
+    };
+  };
 }
 
 function getDb() {
-  return openDB<CalicheCardsDb>("caliche-cards", 3, {
+  return openDB<CalicheCardsDb>("caliche-cards", 4, {
     upgrade(db) {
       if (!db.objectStoreNames.contains("state")) {
         db.createObjectStore("state");
       }
       if (!db.objectStoreNames.contains("media")) {
         db.createObjectStore("media");
+      }
+      if (!db.objectStoreNames.contains("apkg")) {
+        db.createObjectStore("apkg");
       }
     },
   });
@@ -55,9 +73,18 @@ function getDb() {
 export async function saveLastState(state: StoredStateInput): Promise<void> {
   const db = await getDb();
 
+  const existing = await db.get("state", "last");
+  const preservedLastSyncAt =
+    existing && typeof existing === "object" && "lastSyncAt" in existing
+      ? (existing as { lastSyncAt?: unknown }).lastSyncAt
+      : null;
+  const lastSyncAt =
+    "lastSyncAt" in state ? (state.lastSyncAt ?? null) : (typeof preservedLastSyncAt === "number" ? preservedLastSyncAt : null);
+
   const value: StoredState = {
     ...state,
     schemaVersion: STATE_SCHEMA_VERSION,
+    lastSyncAt,
   };
 
   await db.put("state", value, "last");
@@ -134,6 +161,10 @@ export async function loadLastState(): Promise<LoadStateResult> {
         libraries: migratedLibraries,
         activeLibraryId:
           typeof raw.activeLibraryId === "string" ? raw.activeLibraryId : null,
+        lastSyncAt:
+          typeof (raw as { lastSyncAt?: unknown }).lastSyncAt === "number"
+            ? (raw as { lastSyncAt?: number }).lastSyncAt ?? null
+            : null,
         savedAt: typeof raw.savedAt === "number" ? raw.savedAt : Date.now(),
       };
 

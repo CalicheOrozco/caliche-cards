@@ -7,6 +7,7 @@ const PUBLIC_PATHS = new Set<string>(["/login", "/register"]);
 function isPublicPath(pathname: string): boolean {
   if (PUBLIC_PATHS.has(pathname)) return true;
   if (pathname.startsWith("/api/auth/")) return true;
+  if (pathname.startsWith("/api/sync/")) return true;
   if (pathname === "/api/auth") return true;
   return false;
 }
@@ -17,7 +18,7 @@ export async function proxy(req: NextRequest) {
   // Allow public assets and Next internals.
   if (
     pathname.startsWith("/_next/") ||
-    pathname === "/favicon.ico" ||
+    pathname === "/logo.ico" ||
     pathname === "/icon" ||
     pathname === "/apple-icon" ||
     pathname === "/manifest.webmanifest" ||
@@ -49,5 +50,6 @@ export async function proxy(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image).*)"],
+  // Exclude large file uploads from middleware to avoid the 10MB middleware body limit.
+  matcher: ["/((?!_next/static|_next/image|api/sync/upload).*)"],
 };
