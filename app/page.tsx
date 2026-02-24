@@ -429,6 +429,112 @@ function preprocessHtmlForLocalImages(html: string): string {
   }
 }
 
+function htmlToText(inputHtml: string): string {
+  const input = String(inputHtml ?? "");
+  if (!input) return "";
+
+  try {
+    const doc = new DOMParser().parseFromString(input, "text/html");
+    return String(doc.body?.textContent ?? "").replace(/\s+/g, " ").trim();
+  } catch {
+    // Very small fallback; good enough for label inference.
+    return input
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+}
+
+function normalizeLabel(s: string) {
+  return String(s ?? "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+const HIDDEN_FIELD_LABELS = [
+  "Índice",
+  "Sort Index",
+  "Image",
+  "Front of Card",
+  "Word",
+  "word_audio",
+  "phrasal_verb_audio",
+  "Anverso de la tarjeta"
+];
+
+const HIDDEN_FIELD_LABELS_NORMALIZED = new Set(
+  HIDDEN_FIELD_LABELS.map(normalizeLabel)
+);
+
+function shouldHideFieldLabel(label: string) {
+  const target = normalizeLabel(label);
+  if (!target) return false;
+  return HIDDEN_FIELD_LABELS_NORMALIZED.has(target);
+}
+
+function inferFieldLabelsForHtml(args: {
+  html: string;
+  fieldsHtml?: string[];
+  fieldNames?: string[];
+}): string[] {
+  const htmlText = htmlToText(args.html).toLowerCase();
+  if (!htmlText) return [];
+
+  const fields = Array.isArray(args.fieldsHtml) ? args.fieldsHtml : [];
+  const names = Array.isArray(args.fieldNames) ? args.fieldNames : [];
+
+  const out: string[] = [];
+  for (let i = 0; i < fields.length; i += 1) {
+    const fieldText = htmlToText(String(fields[i] ?? "")).toLowerCase();
+    if (!fieldText) continue;
+
+    // Avoid silly matches for ultra-short values.
+    const isShort = fieldText.length < 4;
+    const matches = isShort ? htmlText === fieldText : htmlText.includes(fieldText);
+    if (!matches) continue;
+
+    const label = String(names[i] ?? "").trim() || `Field ${i + 1}`;
+    if (shouldHideFieldLabel(label)) continue;
+    if (!out.includes(label)) out.push(label);
+  }
+
+  return out;
+}
+ 
+function inferFieldSectionsForHtml(args: {
+  html: string;
+  fieldsHtml?: string[];
+  fieldNames?: string[];
+}): Array<{ index: number; label: string; valueHtml: string }> {
+  const htmlText = htmlToText(args.html).toLowerCase();
+  if (!htmlText) return [];
+
+  const fields = Array.isArray(args.fieldsHtml) ? args.fieldsHtml : [];
+  const names = Array.isArray(args.fieldNames) ? args.fieldNames : [];
+
+  const out: Array<{ index: number; label: string; valueHtml: string }> = [];
+  for (let i = 0; i < fields.length; i += 1) {
+    const valueHtml = String(fields[i] ?? "");
+    const fieldText = htmlToText(valueHtml).toLowerCase();
+    if (!fieldText) continue;
+
+    // Avoid silly matches for ultra-short values.
+    const isShort = fieldText.length < 4;
+    const matches = isShort ? htmlText === fieldText : htmlText.includes(fieldText);
+    if (!matches) continue;
+
+    const label = String(names[i] ?? "").trim() || `Field ${i + 1}`;
+    if (shouldHideFieldLabel(label)) continue;
+    out.push({ index: i, label, valueHtml });
+  }
+
+  return out;
+}
+
 function HtmlWithMedia({
   namespace,
   html,
@@ -694,37 +800,19 @@ function FieldsList({
   fields: string[] | undefined;
   names: string[] | undefined;
 }) {
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpen] = useState(true);
 
   const list = (fields ?? []).map((v) => String(v ?? ""));
   const labelList = (names ?? []).map((n) => String(n ?? "").trim());
-
-  function normalizeLabel(s: string) {
-  return String(s ?? "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // quita tildes
-}
-
-function shouldHideFieldLabel(label: string, hiddenLabels: string[]) {
-  const target = normalizeLabel(label);
-  if (!target) return false;
-
-  const hidden = new Set(hiddenLabels.map(normalizeLabel));
-  return hidden.has(target);
-}
-
-  const HIDDEN_FIELD_LABELS = ["Índice", "Sort Index","Image"];
 
   const nonEmpty = list
     .map((value, index) => ({
       index,
       value: value.trim(),
-      label: labelList[index] || "",
+      label: labelList[index] || `Field ${index + 1}`,
     }))
     .filter((x) => x.value !== "")
-    .filter((x) => !shouldHideFieldLabel(x.label, HIDDEN_FIELD_LABELS));
+    .filter((x) => !shouldHideFieldLabel(x.label));
 
   if (nonEmpty.length === 0) return null;
 
@@ -2495,6 +2583,24 @@ export default function Home() {
     return null;
   }, [current]);
 
+  const answerFieldLabels = useMemo(() => {
+    if (!current) return [];
+    return inferFieldLabelsForHtml({
+      html: current.card.backHtml,
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+    });
+  }, [current]);
+  
+  const answerFieldSections = useMemo(() => {
+    if (!current) return [];
+    return inferFieldSectionsForHtml({
+      html: current.card.backHtml,
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+    });
+  }, [current]);
+
   useEffect(() => {
     if (mode !== "review") return;
     if (currentId == null) return;
@@ -2981,16 +3087,45 @@ export default function Home() {
 
                     {showAnswer ? (
                       <div className="border-t border-foreground/15 pt-6">
-                        <CardFace
-                          namespace={activeNamespace}
-                          html={current.card.backHtml}
-                          suppressFirstSoundFilename={
-                            promotedSound?.source === "back"
-                              ? promotedSound.filename
-                              : null
-                          }
-                          className="text-center text-xl leading-8"
-                        />
+                        {answerFieldSections.length > 0 ? (
+                          <div className="flex flex-col gap-4">
+                            {answerFieldSections.map((sec, idx) => (
+                              <div key={`${sec.index}-${sec.label}`}>
+                                <div className="mb-1 text-xs font-medium text-foreground/60">
+                                  {sec.label}:
+                                </div>
+                                <CardFace
+                                  namespace={activeNamespace}
+                                  html={sec.valueHtml}
+                                  suppressFirstSoundFilename={
+                                    idx === 0 && promotedSound?.source === "back"
+                                      ? promotedSound.filename
+                                      : null
+                                  }
+                                  className="text-center text-xl leading-8"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <>
+                            {answerFieldLabels.length > 0 ? (
+                              <div className="mb-3 text-xs font-medium text-foreground/60">
+                                {answerFieldLabels.join(" • ")}
+                              </div>
+                            ) : null}
+                            <CardFace
+                              namespace={activeNamespace}
+                              html={current.card.backHtml}
+                              suppressFirstSoundFilename={
+                                promotedSound?.source === "back"
+                                  ? promotedSound.filename
+                                  : null
+                              }
+                              className="text-center text-xl leading-8"
+                            />
+                          </>
+                        )}
                       </div>
                     ) : null}
 
