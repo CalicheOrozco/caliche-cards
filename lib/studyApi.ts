@@ -33,8 +33,13 @@ export type DeckOverview = {
   // Cards scheduled for later today/soon (available but not due yet)
   learningWaiting: number;
 
-  // Earliest upcoming due timestamp among learn/relearn (available).
+  // Earliest upcoming due timestamp among learn/relearn/review (available).
   nextDueTs: number | null;
+
+  // Earliest time the user can study again, considering daily limits.
+  // Example: if you hit new/review daily caps but there are still cards,
+  // this will be the next local day start.
+  nextAvailableTs: number | null;
 
   // What the deck list should show (due, capped by limits).
   newShown: number;
@@ -319,6 +324,46 @@ async function countWaiting(ref: DeckRef, state: StudyState, now: number): Promi
   return { count, nextDueTs };
 }
 
+async function findNextDueAfter(
+  ref: DeckRef,
+  state: StudyState,
+  now: number
+): Promise<number | null> {
+  const db = getStudyDb();
+
+  // The compound index ends with `due`, so this query is ordered by due asc.
+  // We scan in chunks to skip suspended/buried cards efficiently.
+  const LIMIT = 500;
+  let start = now + 1;
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  for (let i = 0; i < 20; i += 1) {
+    const batch = await db.cardStates
+      .where("[libraryId+deckId+state+due]")
+      .between(
+        [ref.libraryId, ref.deckId, state, start],
+        [ref.libraryId, ref.deckId, state, MAX],
+        true,
+        true
+      )
+      .limit(LIMIT)
+      .toArray();
+
+    if (batch.length === 0) return null;
+
+    for (const s of batch) {
+      if (isAvailable(s, now)) return s.due;
+    }
+
+    if (batch.length < LIMIT) return null;
+    const lastDue = batch[batch.length - 1]?.due ?? null;
+    if (typeof lastDue !== "number" || !Number.isFinite(lastDue)) return null;
+    start = Math.max(start, lastDue + 1);
+  }
+
+  return null;
+}
+
 export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
   const db = getStudyDb();
   const now = Date.now();
@@ -355,12 +400,20 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
   ]);
 
   const learningWaiting = learnWaiting.count + relearnWaiting.count;
-  const nextDueTs =
-    learnWaiting.nextDueTs == null
-      ? relearnWaiting.nextDueTs
-      : relearnWaiting.nextDueTs == null
-        ? learnWaiting.nextDueTs
-        : Math.min(learnWaiting.nextDueTs, relearnWaiting.nextDueTs);
+
+  const [nextLearnTs, nextRelearnTs, nextReviewTs] = await Promise.all([
+    findNextDueAfter(ref, "learn", now),
+    findNextDueAfter(ref, "relearn", now),
+    findNextDueAfter(ref, "review", now),
+  ]);
+
+  const nextDueTs = (() => {
+    const candidates = [nextLearnTs, nextRelearnTs, nextReviewTs].filter(
+      (x): x is number => typeof x === "number" && Number.isFinite(x) && x > now
+    );
+    if (candidates.length === 0) return null;
+    return Math.min(...candidates);
+  })();
 
   // Reviewed = unique notes that have been answered at least once.
   const reviewedNoteIds = new Set<number>();
@@ -376,6 +429,33 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
   const newShown = Math.min(newAvailable, newLeftToday);
   const reviewShown = Math.min(reviewDue, reviewsLeftToday);
 
+  const nextAvailableTs = (() => {
+    const candidates: number[] = [];
+
+    // Learning is never limited by daily caps.
+    if (typeof nextLearnTs === "number" && nextLearnTs > now) candidates.push(nextLearnTs);
+    if (typeof nextRelearnTs === "number" && nextRelearnTs > now) candidates.push(nextRelearnTs);
+
+    const dayResetTs = getLocalNextDayStart(now);
+
+    const hasMoreNewButCapped = newLeftToday === 0 && newAvailable > 0;
+    if (hasMoreNewButCapped) candidates.push(dayResetTs);
+
+    const hasAnyReviewUpcomingOrDue =
+      reviewDue > 0 || (typeof nextReviewTs === "number" && nextReviewTs > now);
+
+    const reviewsCapped = reviewsLeftToday === 0;
+    if (reviewsCapped && hasAnyReviewUpcomingOrDue) {
+      // Even if reviews are due sooner, they won't show until the cap resets.
+      candidates.push(dayResetTs);
+    } else if (!reviewsCapped && typeof nextReviewTs === "number" && nextReviewTs > now) {
+      candidates.push(nextReviewTs);
+    }
+
+    if (candidates.length === 0) return null;
+    return Math.min(...candidates);
+  })();
+
   return {
     total,
     reviewed,
@@ -386,6 +466,7 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
     reviewDue,
     learningWaiting,
     nextDueTs,
+    nextAvailableTs,
     newShown,
     reviewShown,
     config: {

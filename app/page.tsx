@@ -2553,16 +2553,17 @@ export default function Home() {
     if (mode !== "review") return;
     if (!reviewRef) return;
     if (current) return;
-    const ts = reviewOverview?.nextDueTs ?? null;
+    const ts = reviewOverview?.nextAvailableTs ?? reviewOverview?.nextDueTs ?? null;
     if (ts == null) return;
 
-    const delayMs = Math.max(250, ts - Date.now());
+    const MAX_TIMEOUT_MS = 2_147_483_647; // setTimeout max (~24.8 days)
+    const delayMs = Math.min(MAX_TIMEOUT_MS, Math.max(250, ts - Date.now()));
     const id = window.setTimeout(() => {
       void loadNext(reviewRef);
     }, delayMs);
 
     return () => window.clearTimeout(id);
-  }, [mode, reviewRef, current, reviewOverview?.nextDueTs]);
+  }, [mode, reviewRef, current, reviewOverview?.nextAvailableTs, reviewOverview?.nextDueTs]);
 
   async function beginReview(libraryId: string, deckId: number) {
     setError(null);
@@ -3288,17 +3289,16 @@ export default function Home() {
                 <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-6 text-center">
                   <div className="text-lg font-semibold">All done for today!</div>
                   <div className="mt-1 text-sm text-foreground/70">
-                    {reviewOverview?.nextDueTs ? (
+                    {reviewOverview?.nextAvailableTs != null || reviewOverview?.nextDueTs != null ? (
                       (() => {
-                        const ms = Math.max(0, reviewOverview.nextDueTs - nowTs);
-                        const totalSec = Math.ceil(ms / 1000);
-                        const m = Math.floor(totalSec / 60);
-                        const s = totalSec % 60;
-                        const mmss = `${m}:${String(s).padStart(2, "0")}`;
+                        const nextTs = reviewOverview?.nextAvailableTs ?? reviewOverview?.nextDueTs ?? nowTs;
+                        const inLabel = formatIn(nextTs, nowTs);
+                        const atLabel = new Date(nextTs).toLocaleTimeString();
                         const waiting = reviewOverview.learningWaiting;
                         return (
                           <>
-                            Next card in <span className="font-medium">{mmss}</span>
+                            Next card in <span className="font-medium">{inLabel}</span>
+                            <span className="text-foreground/60"> (at {atLabel})</span>
                             {waiting > 0 ? (
                               <>
                                 {" "}• Waiting: <span className="font-medium">{waiting}</span>
