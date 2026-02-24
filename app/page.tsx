@@ -314,7 +314,7 @@ function SoundButton({
   }
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center justify-center gap-2">
       <button
         type="button"
         onClick={handlePlay}
@@ -3291,7 +3291,7 @@ export default function Home() {
                           <div className="flex flex-col gap-4">
                             {answerFieldSections.map((sec, idx) => (
                               <div key={`${sec.index}-${sec.label}`}>
-                                <div className="mb-1 text-xs font-medium text-foreground/60">
+                                <div className="mb-1 text-xs text-center font-medium text-foreground/60">
                                   {sec.label}:
                                 </div>
                                 <CardFace
