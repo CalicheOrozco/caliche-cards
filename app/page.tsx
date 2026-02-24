@@ -2616,6 +2616,7 @@ export default function Home() {
   }, [mode, reviewRef, current, reviewOverview?.nextAvailableTs, reviewOverview?.nextDueTs]);
 
   async function beginReview(libraryId: string, deckId: number) {
+    if (syncBusy) return;
     setError(null);
     setReviewBusy(true);
 
@@ -2643,6 +2644,7 @@ export default function Home() {
   }
 
   function startReviewFor(libraryId: string, deckId: number) {
+    if (syncBusy) return;
     const lib = libraries.find((l) => l.id === libraryId) ?? null;
     if (!lib) return;
 
@@ -2945,8 +2947,11 @@ export default function Home() {
                           >
                             <button
                               type="button"
-                              className="min-w-0 cursor-pointer text-left"
+                              className={`min-w-0 text-left ${syncBusy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
                               onClick={() => startReviewFor(lib.id, d.id)}
+                              disabled={syncBusy}
+                              aria-disabled={syncBusy}
+                              title={syncBusy ? "Syncing…" : "Open deck"}
                             >
                               <div
                                 className="truncate text-sm font-medium"
