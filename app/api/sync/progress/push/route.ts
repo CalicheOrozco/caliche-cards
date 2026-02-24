@@ -64,6 +64,7 @@ type DeckConfigPayload = {
   deckId: number;
   newPerDay: number;
   reviewsPerDay: number;
+  cardInfoOpenByDefault?: boolean;
   updatedAt: number;
 };
 
@@ -147,6 +148,7 @@ export async function POST(req: NextRequest) {
       deckId: typeof d.deckId === "number" ? d.deckId : Number(d.deckId),
       newPerDay: typeof d.newPerDay === "number" ? d.newPerDay : Number(d.newPerDay),
       reviewsPerDay: typeof d.reviewsPerDay === "number" ? d.reviewsPerDay : Number(d.reviewsPerDay),
+      cardInfoOpenByDefault: Boolean((d as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
       updatedAt: typeof d.updatedAt === "number" ? d.updatedAt : Number(d.updatedAt),
     }))
     .filter((d) => Number.isFinite(d.deckId) && d.deckId > 0)
@@ -156,6 +158,7 @@ export async function POST(req: NextRequest) {
       deckId: Math.floor(d.deckId),
       newPerDay: Number.isFinite(d.newPerDay) ? Math.max(0, Math.floor(d.newPerDay)) : 0,
       reviewsPerDay: Number.isFinite(d.reviewsPerDay) ? Math.max(0, Math.floor(d.reviewsPerDay)) : 0,
+      cardInfoOpenByDefault: Boolean(d.cardInfoOpenByDefault),
       updatedAt: d.updatedAt,
     }));
 
@@ -261,6 +264,7 @@ export async function POST(req: NextRequest) {
             deckId: d.deckId,
             newPerDay: d.newPerDay,
             reviewsPerDay: d.reviewsPerDay,
+            cardInfoOpenByDefault: Boolean(d.cardInfoOpenByDefault),
             updatedAt: d.updatedAt,
             uploadedAt: now,
           },

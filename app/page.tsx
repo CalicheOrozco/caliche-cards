@@ -21,6 +21,7 @@ import {
   getDeckOverview,
   getNextCard,
   resetDeckProgress,
+  setDeckCardInfoOpenByDefault,
   setDeckNewPerDay,
   startStudySession,
   upsertImportedDeck,
@@ -42,6 +43,7 @@ type ProgressPullResponse = {
     deckId: number;
     newPerDay: number;
     reviewsPerDay: number;
+    cardInfoOpenByDefault?: boolean;
     updatedAt: number;
   }>;
 };
@@ -795,12 +797,14 @@ function FieldsList({
   namespace,
   fields,
   names,
+  defaultOpen,
 }: {
   namespace: string;
   fields: string[] | undefined;
   names: string[] | undefined;
+  defaultOpen?: boolean;
 }) {
-  const [isOpen, setIsOpen] = useState(true);
+  const [isOpen, setIsOpen] = useState(() => Boolean(defaultOpen));
 
   const list = (fields ?? []).map((v) => String(v ?? ""));
   const labelList = (names ?? []).map((n) => String(n ?? "").trim());
@@ -1267,6 +1271,7 @@ export default function Home() {
                 deckId: ref.deckId,
                 newPerDay: row.newPerDay,
                 reviewsPerDay: row.reviewsPerDay,
+                cardInfoOpenByDefault: Boolean((row as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
                 updatedAt: row.updatedAt,
               },
             ],
@@ -1850,6 +1855,7 @@ export default function Home() {
                 deckId: d.deckId,
                 newPerDay: d.newPerDay,
                 reviewsPerDay: d.reviewsPerDay,
+                cardInfoOpenByDefault: Boolean((d as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
                 updatedAt: d.updatedAt,
               })),
             }),
@@ -1936,6 +1942,7 @@ export default function Home() {
                 name,
                 newPerDay: Math.max(0, Math.floor(Number(cfg.newPerDay) || 0)),
                 reviewsPerDay: Math.max(0, Math.floor(Number(cfg.reviewsPerDay) || 0)),
+                cardInfoOpenByDefault: Boolean((cfg as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
                 createdAt: local?.createdAt ?? updatedAt,
                 updatedAt,
               });
@@ -2129,6 +2136,46 @@ export default function Home() {
     [reviewRef, pushDeckConfigToCloudNow]
   );
 
+  const commitCardInfoDefaultOpen = useCallback(
+    async (libraryId: string, deckId: number, next: boolean) => {
+      await setDeckCardInfoOpenByDefault({ libraryId, deckId }, next);
+
+      // Push deck config to cloud immediately (no Sync button).
+      try {
+        await pushDeckConfigToCloudNow({ libraryId, deckId });
+      } catch {
+        setError("Updated locally, but failed to update cloud settings.");
+      }
+
+      // Optimistically reflect in UI even if overview refresh lags.
+      setDeckOverviews((prev) => {
+        const key = `${libraryId}:${deckId}`;
+        const existing = prev[key];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          [key]: {
+            ...existing,
+            config: {
+              ...existing.config,
+              cardInfoOpenByDefault: Boolean(next),
+            },
+          },
+        };
+      });
+
+      const ov = await getDeckOverview({ libraryId, deckId });
+      setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
+
+      if (reviewRef?.libraryId === libraryId && reviewRef.deckId === deckId) {
+        setReviewOverview(ov);
+        const cfg = await getDeckConfig({ libraryId, deckId });
+        setReviewDeckConfig(cfg);
+      }
+    },
+    [reviewRef, pushDeckConfigToCloudNow]
+  );
+
   useEffect(() => {
     if (!openDeckMenu) return;
 
@@ -2245,6 +2292,7 @@ export default function Home() {
             name: trimmed,
             newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
             reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+            cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
             createdAt: now,
             updatedAt: now,
           });
@@ -2954,6 +3002,24 @@ export default function Home() {
                                     </button>
                                   </div>
 
+                                  <div className="px-3 py-2">
+                                    <label className="flex items-center justify-between gap-3 text-xs text-foreground/70">
+                                      <span>Card info open</span>
+                                      <input
+                                        type="checkbox"
+                                        className="h-4 w-4"
+                                        checked={Boolean(overview?.config.cardInfoOpenByDefault)}
+                                        onChange={(e) => {
+                                          void commitCardInfoDefaultOpen(
+                                            lib.id,
+                                            d.id,
+                                            e.currentTarget.checked
+                                          );
+                                        }}
+                                      />
+                                    </label>
+                                  </div>
+
                                   <button
                                     type="button"
                                     className="w-full rounded-lg px-3 py-2 text-left text-sm text-red-500 hover:bg-foreground/5"
@@ -3131,9 +3197,11 @@ export default function Home() {
 
                     {showAnswer ? (
                       <FieldsList
+                        key={`${activeNamespace}:${reviewRef?.deckId ?? current.card.deckId}`}
                         namespace={activeNamespace}
                         fields={current.card.fieldsHtml}
                         names={current.card.fieldNames}
+                        defaultOpen={Boolean(reviewDeckConfig?.cardInfoOpenByDefault)}
                       />
                     ) : null}
                   </div>

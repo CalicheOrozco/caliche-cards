@@ -5,6 +5,7 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_DECK_CONFIG: DeckConfig = {
   newPerDay: 10,
   reviewsPerDay: 200,
+  cardInfoOpenByDefault: false,
   learnStepsMs: [10 * 60 * 1000, 1 * DAY_MS],
   relearnStepsMs: [10 * 60 * 1000],
   graduatingIntervalDays: 3,

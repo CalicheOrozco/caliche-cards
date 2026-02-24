@@ -40,7 +40,7 @@ export type DeckOverview = {
   newShown: number;
   reviewShown: number;
 
-  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay">;
+  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay" | "cardInfoOpenByDefault">;
 };
 
 function isAvailable(state: CardStateEntity, now: number): boolean {
@@ -58,7 +58,36 @@ export async function getDeckConfig(ref: DeckRef): Promise<DeckConfig> {
     ...DEFAULT_DECK_CONFIG,
     newPerDay: deck.newPerDay,
     reviewsPerDay: deck.reviewsPerDay,
+    cardInfoOpenByDefault: Boolean(deck.cardInfoOpenByDefault),
   };
+}
+
+export async function setDeckCardInfoOpenByDefault(
+  ref: DeckRef,
+  cardInfoOpenByDefault: boolean
+): Promise<void> {
+  const db = getStudyDb();
+  const next = Boolean(cardInfoOpenByDefault);
+  const now = Date.now();
+
+  const updated = await db.decks.update([ref.libraryId, ref.deckId], {
+    cardInfoOpenByDefault: next,
+    updatedAt: now,
+  });
+
+  // If the deck row doesn't exist yet (race with initial seeding), create it.
+  if (updated === 0) {
+    await db.decks.put({
+      libraryId: ref.libraryId,
+      deckId: ref.deckId,
+      name: "",
+      newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
+      reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+      cardInfoOpenByDefault: next,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
 }
 
 export async function setDeckNewPerDay(ref: DeckRef, newPerDay: number): Promise<void> {
@@ -79,6 +108,7 @@ export async function setDeckNewPerDay(ref: DeckRef, newPerDay: number): Promise
       name: "",
       newPerDay: next,
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+      cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
       createdAt: now,
       updatedAt: now,
     });
@@ -102,6 +132,8 @@ export async function upsertImportedDeck(libraryId: string, imported: ImportedDe
         name: d.name,
         newPerDay: prev?.newPerDay ?? DEFAULT_DECK_CONFIG.newPerDay,
         reviewsPerDay: prev?.reviewsPerDay ?? DEFAULT_DECK_CONFIG.reviewsPerDay,
+        cardInfoOpenByDefault:
+          prev?.cardInfoOpenByDefault ?? DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
         createdAt: prev?.createdAt ?? now,
         updatedAt: now,
       };
@@ -356,7 +388,11 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
     nextDueTs,
     newShown,
     reviewShown,
-    config: { newPerDay: cfg.newPerDay, reviewsPerDay: cfg.reviewsPerDay },
+    config: {
+      newPerDay: cfg.newPerDay,
+      reviewsPerDay: cfg.reviewsPerDay,
+      cardInfoOpenByDefault: cfg.cardInfoOpenByDefault,
+    },
   };
 }
 

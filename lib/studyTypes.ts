@@ -11,6 +11,9 @@ export type DeckConfig = {
   newPerDay: number;
   reviewsPerDay: number;
 
+  // UI preference: whether the "Card info" dropdown should be open by default.
+  cardInfoOpenByDefault: boolean;
+
   // Learning / relearning delays after a PASS while in learn/relearn.
   learnStepsMs: number[];
   relearnStepsMs: number[];
@@ -38,6 +41,9 @@ export type DeckEntity = {
 
   newPerDay: number;
   reviewsPerDay: number;
+
+  // UI preference (not used by scheduler).
+  cardInfoOpenByDefault?: boolean;
 
   createdAt: number;
   updatedAt: number;
