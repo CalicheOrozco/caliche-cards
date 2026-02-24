@@ -62,10 +62,50 @@ function decodeMediaEntryName(entryBytes) {
   return "";
 }
 
+function decodeMediaEntry(entryBytes) {
+  // Observed modern MediaEntry fields:
+  // - field 1 (wire 2): string name
+  // - field 2 (wire 0): varint id (NOT necessarily the zip entry key)
+  let name = "";
+  let entryId = null;
+
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let i = 0;
+  while (i < entryBytes.length) {
+    const key = readVarint(entryBytes, i);
+    i = key.offset;
+    const field = key.value >>> 3;
+    const wire = key.value & 0x7;
+
+    if (field === 1 && wire === 2) {
+      const len = readVarint(entryBytes, i);
+      i = len.offset;
+      const end = i + len.value;
+      if (end > entryBytes.length) throw new Error("protobuf string out of bounds");
+      name = decoder.decode(entryBytes.subarray(i, end));
+      i = end;
+      continue;
+    }
+
+    if (field === 2 && wire === 0) {
+      const v = readVarint(entryBytes, i);
+      entryId = String(v.value);
+      i = v.offset;
+      continue;
+    }
+
+    i = skipWireValue(entryBytes, i, wire);
+    if (i > entryBytes.length) throw new Error("protobuf field out of bounds");
+  }
+
+  return { name, entryId };
+}
+
 function decodeMediaEntries(bytes) {
   // MediaEntries: field 1 repeated MediaEntry entries = 1;
-  const names = [];
+  const entries = [];
   let i = 0;
+  let idx = 0;
   while (i < bytes.length) {
     const key = readVarint(bytes, i);
     i = key.offset;
@@ -78,16 +118,18 @@ function decodeMediaEntries(bytes) {
       const end = i + len.value;
       if (end > bytes.length) throw new Error("protobuf embedded message out of bounds");
       const entryBytes = bytes.subarray(i, end);
-      const name = decodeMediaEntryName(entryBytes).trim();
-      if (name) names.push(name);
+      const decoded = decodeMediaEntry(entryBytes);
+      const name = String(decoded.name ?? "").trim();
+      if (name) entries.push({ name, idx, entryId: decoded.entryId });
       i = end;
+      idx += 1;
       continue;
     }
 
     i = skipWireValue(bytes, i, wire);
     if (i > bytes.length) throw new Error("protobuf field out of bounds");
   }
-  return names;
+  return entries;
 }
 
 function isZstd(bytes) {
@@ -124,7 +166,9 @@ if (!mediaFile) {
 
 const mediaBytes = await mediaFile.async("uint8array");
 const decodedBytes = isZstd(mediaBytes) ? decompress(mediaBytes) : mediaBytes;
-const names = decodeMediaEntries(decodedBytes);
+const entries = decodeMediaEntries(decodedBytes);
+const names = entries.map((e) => e.name);
+const entryByName = new Map(entries.map((e) => [e.name, e]));
 
 console.log("apkg", apkgPath);
 console.log("zip entries", Object.keys(zip.files).length);
@@ -140,9 +184,14 @@ console.log("casefold index", foldIndex);
 
 const idx = foldIndex >= 0 ? foldIndex : exactIndex;
 if (idx >= 0) {
+  const canonical = names[idx];
+  const meta = canonical ? entryByName.get(canonical) : null;
   const mediaKey = String(idx);
   const entry = zip.file(mediaKey) ?? zip.file(new RegExp(`(^|/)${mediaKey}$`))?.[0] ?? null;
   console.log("media key", mediaKey, "zip entry exists", Boolean(entry));
+  if (meta?.entryId) {
+    console.log("protobuf entryId (field2)", meta.entryId);
+  }
   if (entry) {
     const b = await entry.async("uint8array");
     console.log("zip entry bytes", b.length, "first8", hex(b, 8));
@@ -152,7 +201,6 @@ if (idx >= 0) {
     }
   }
 
-  const canonical = names[idx];
   if (canonical && canonical !== query) {
     console.log("canonical name", canonical);
   }

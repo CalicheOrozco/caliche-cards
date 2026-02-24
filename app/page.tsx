@@ -146,7 +146,29 @@ async function tryPlayAudioFilename(
   namespace: string,
   filename: string
 ): Promise<void> {
-  const blob = await getMediaBlob(namespace, filename);
+  const ensureMediaFromCachedApkg = async (): Promise<boolean> => {
+    // Best-effort: if media wasn't stored (quota/bug), attempt to re-extract it
+    // from the locally cached .apkg for this library.
+    const stored = await getApkgFile(namespace).catch(() => null);
+    if (!stored) return false;
+    const file = new File([stored.blob], stored.filename || "deck.apkg", {
+      type: "application/octet-stream",
+    });
+    try {
+      await importApkg(file, { mediaNamespace: namespace });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let blob = await getMediaBlob(namespace, filename);
+  if (!blob) {
+    const repaired = await ensureMediaFromCachedApkg();
+    if (repaired) {
+      blob = await getMediaBlob(namespace, filename);
+    }
+  }
   if (!blob) throw new Error("blob not found");
 
   const url = URL.createObjectURL(blob);
@@ -331,6 +353,26 @@ function HtmlWithMedia({
       let resolvedCount = 0;
       let missingCount = 0;
 
+      let attemptedRepair = false;
+      const ensureMediaFromCachedApkg = async (): Promise<boolean> => {
+        if (attemptedRepair) return false;
+        attemptedRepair = true;
+
+        const stored = await getApkgFile(namespace).catch(() => null);
+        if (!stored) return false;
+
+        const file = new File([stored.blob], stored.filename || "deck.apkg", {
+          type: "application/octet-stream",
+        });
+
+        try {
+          await importApkg(file, { mediaNamespace: namespace });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
       for (const img of imgs) {
         if (cancelled) return;
 
@@ -352,6 +394,37 @@ function HtmlWithMedia({
           }
         }
         if (!blob) {
+          const repaired = await ensureMediaFromCachedApkg();
+          if (repaired) {
+            for (const cand of candidates) {
+              blob = await getMediaBlob(namespace, cand);
+              if (blob) {
+                resolved = cand;
+                break;
+              }
+            }
+          }
+
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            objectUrlsRef.current.push(url);
+
+            if (cancelled) {
+              try {
+                URL.revokeObjectURL(url);
+              } catch {
+                // ignore
+              }
+              continue;
+            }
+
+            img.setAttribute("src", url);
+            if (resolved) img.setAttribute("data-caliche-media", resolved);
+            img.removeAttribute("data-caliche-missing");
+            resolvedCount += 1;
+            continue;
+          }
+
           missingCount += 1;
           img.setAttribute("data-caliche-missing", "1");
           continue;
