@@ -2631,6 +2631,18 @@ export default function Home() {
     return null;
   }, [current]);
 
+  const currentTimingTag = useMemo(() => {
+    if (!current) return null;
+    const due = typeof current.state?.due === "number" ? current.state.due : 0;
+    if (!Number.isFinite(due)) return { kind: "due" as const, label: "Due", detail: null };
+    const isWaiting = due > nowTs;
+    return {
+      kind: (isWaiting ? "waiting" : "due") as const,
+      label: isWaiting ? "Waiting" : "Due",
+      detail: isWaiting ? `in ${formatIn(due, nowTs)}` : null,
+    };
+  }, [current, nowTs]);
+
   const answerFieldLabels = useMemo(() => {
     if (!current) return [];
     return inferFieldLabelsForHtml({
@@ -3127,6 +3139,17 @@ export default function Home() {
 
               {current ? (
                 <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-foreground/5 p-6">
+                  {currentTimingTag ? (
+                    <div className="absolute left-4 top-4 text-xs text-foreground/60">
+                      <span className="font-semibold text-foreground">
+                        {currentTimingTag.label}
+                      </span>
+                      {currentTimingTag.detail ? (
+                        <span className="text-foreground/60"> {currentTimingTag.detail}</span>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   {promotedSound?.filename ? (
                     <div className="absolute right-4 top-4">
                       <SoundButton
