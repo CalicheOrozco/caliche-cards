@@ -694,6 +694,8 @@ function FieldsList({
   fields: string[] | undefined;
   names: string[] | undefined;
 }) {
+  const [isOpen, setIsOpen] = useState(false);
+
   const list = (fields ?? []).map((v) => String(v ?? ""));
   const labelList = (names ?? []).map((n) => String(n ?? "").trim());
 
@@ -728,19 +730,33 @@ function shouldHideFieldLabel(label: string, hiddenLabels: string[]) {
 
   return (
     <div className="rounded-2xl border border-foreground/15 p-4">
-      <div className="mb-3 text-xs font-medium text-foreground/70">Card info</div>
-      <div className="flex flex-col gap-3">
-        {nonEmpty.map(({ index, value, label }) => (
-          <div key={index} className="rounded-xl border border-foreground/10 p-3">
-            {label ? (
-              <div className="mb-1 text-[11px] font-medium text-foreground/60">
-                {label}
-              </div>
-            ) : null}
-            <CardFace namespace={namespace} html={value} />
-          </div>
-        ))}
-      </div>
+      <button
+        type="button"
+        onClick={() => setIsOpen((v) => !v)}
+        aria-expanded={isOpen}
+        className="flex w-full items-center justify-between gap-3 text-left text-xs font-medium text-foreground/70"
+      >
+        <span>Card info</span>
+        <span className="flex items-center gap-2 text-[11px] font-medium text-foreground/60">
+          <span>{isOpen ? "Hide" : "Show"}</span>
+          <span aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
+        </span>
+      </button>
+
+      {isOpen ? (
+        <div className="mt-3 flex flex-col gap-3">
+          {nonEmpty.map(({ index, value, label }) => (
+            <div key={index} className="rounded-xl border border-foreground/10 p-3">
+              {label ? (
+                <div className="mb-1 text-[11px] font-medium text-foreground/60">
+                  {label}
+                </div>
+              ) : null}
+              <CardFace namespace={namespace} html={value} />
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2506,7 +2522,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-10">
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-5 py-10">
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">
