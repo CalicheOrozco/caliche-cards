@@ -1771,7 +1771,10 @@ export default function Home() {
       }
 
       // Sync study progress (card states + review logs) bidirectionally.
-      const since = lastSyncAt ?? 0;
+      // Use cloud time (uploadedAt/serverTime) for incremental pulls.
+      // Subtract 1ms to avoid missing entries exactly on the boundary.
+      const since = Math.max(0, (lastSyncAt ?? 0) - 1);
+      let maxServerTime = since;
       const db = getStudyDb();
       const MAX_TS = Number.MAX_SAFE_INTEGER;
 
@@ -1923,6 +1926,15 @@ export default function Home() {
         }
 
         const pullData: unknown = await pullRes.json().catch(() => null);
+
+        const serverTime = (() => {
+          if (!pullData || typeof pullData !== "object") return null;
+          const raw = (pullData as { serverTime?: unknown }).serverTime;
+          const n = typeof raw === "number" ? raw : Number(raw);
+          return Number.isFinite(n) && n > 0 ? n : null;
+        })();
+        if (serverTime != null) maxServerTime = Math.max(maxServerTime, serverTime);
+
         const remoteCardStates: CardStateEntity[] = (() => {
           if (!pullData || typeof pullData !== "object") return [];
           const raw = (pullData as Partial<ProgressPullResponse>).cardStates;
@@ -2115,7 +2127,7 @@ export default function Home() {
       }
 
       setPhase("Finalizing sync…");
-      const ts = Date.now();
+      const ts = Math.max(Date.now(), maxServerTime);
       setLastSyncAt(ts);
       await saveLastState({
         libraries: mergedLibraries,

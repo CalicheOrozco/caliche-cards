@@ -40,19 +40,19 @@ export async function GET(req: NextRequest) {
 
   const cardStates = await db
     .collection("cloudCardStates")
-    .find({ userId, libraryId, uploadedAt: { $gt: since } })
+    .find({ userId, libraryId, uploadedAt: { $gte: since } })
     .project({ _id: 0, userId: 0, uploadedAt: 0 })
     .toArray();
 
   const reviewLogs = await db
     .collection("cloudReviewLogs")
-    .find({ userId, libraryId, uploadedAt: { $gt: since } })
+    .find({ userId, libraryId, uploadedAt: { $gte: since } })
     .project({ _id: 0, userId: 0, uploadedAt: 0 })
     .toArray();
 
   const deckConfigs = await db
     .collection("cloudDeckConfigs")
-    .find({ userId, libraryId, uploadedAt: { $gt: since } })
+    .find({ userId, libraryId, uploadedAt: { $gte: since } })
     .project({ _id: 0, userId: 0, uploadedAt: 0 })
     .toArray();
 
