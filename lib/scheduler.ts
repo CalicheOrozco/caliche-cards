@@ -28,6 +28,21 @@ export function getLocalNextDayStart(ts: number): number {
   return d.getTime();
 }
 
+function getLocalDayStartPlusDays(ts: number, days: number): number {
+  const d = new Date(getLocalDayStart(ts));
+  d.setDate(d.getDate() + Math.max(0, Math.floor(days)));
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function snapDue(now: number, due: number): number {
+  const delay = due - now;
+  // For waits of 24h+ we schedule on the local day boundary (midnight)
+  // instead of “exactly N hours from now”.
+  if (delay >= DAY_MS) return getLocalDayStart(due);
+  return due;
+}
+
 function clampMinInterval(intervalDays: number, cfg: DeckConfig): number {
   return Math.max(cfg.minIntervalDays, Math.round(intervalDays));
 }
@@ -61,12 +76,13 @@ export function scheduleAnswer(
 
   const graduateToReview = (intervalDays: number) => {
     const nextIntervalDays = clampMinInterval(intervalDays, cfg);
+    const due = getLocalDayStartPlusDays(now, nextIntervalDays);
     return {
       ...base,
       nextState: "review" as const,
       nextStepIndex: 0,
       nextIntervalDays,
-      nextDue: now + nextIntervalDays * DAY_MS,
+      nextDue: due,
     };
   };
 
@@ -91,11 +107,12 @@ export function scheduleAnswer(
 
     if (stepIndex < stepsMs.length) {
       const delay = stepsMs[stepIndex] ?? 0;
+      const due = snapDue(now, now + delay);
       return {
         ...base,
         nextState: mode,
         nextStepIndex: stepIndex + 1,
-        nextDue: now + delay,
+        nextDue: due,
       };
     }
 
@@ -124,12 +141,14 @@ export function scheduleAnswer(
   // REVIEW
   if (result === "pass") {
     const grown = prev.intervalDays > 0 ? prev.intervalDays * cfg.easeFactor : cfg.graduatingIntervalDays;
+    const nextIntervalDays = clampMinInterval(grown, cfg);
+    const due = getLocalDayStartPlusDays(now, nextIntervalDays);
     return {
       ...base,
       nextState: "review",
       nextStepIndex: 0,
-      nextIntervalDays: clampMinInterval(grown, cfg),
-      nextDue: now + clampMinInterval(grown, cfg) * DAY_MS,
+      nextIntervalDays,
+      nextDue: due,
     };
   }
 
