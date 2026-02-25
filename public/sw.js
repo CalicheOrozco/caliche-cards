@@ -1,9 +1,19 @@
  
 
 // Bump this when changing caching behavior to ensure old caches are dropped.
-const CACHE_NAME = "caliche-cards-v2";
+const CACHE_NAME = "caliche-cards-v3";
 
-const PRECACHE_URLS = ["/", "/manifest.webmanifest", "/icon", "/apple-icon"];
+const PRECACHE_URLS = [
+  "/",
+  "/manifest.webmanifest",
+  "/favicon.ico",
+  "/favicon-16x16.png",
+  "/favicon-32x32.png",
+  "/apple-touch-icon.png",
+  "/apple-touch-icon-precomposed.png",
+  "/icon",
+  "/apple-icon",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -41,6 +51,23 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   // Never cache API responses.
   if (url.pathname.startsWith("/api/")) return;
+
+  // Don't cache icons; browsers (Safari especially) can get stuck on old ones.
+  if (
+    url.pathname === "/favicon.ico" ||
+    url.pathname === "/favicon-16x16.png" ||
+    url.pathname === "/favicon-32x32.png" ||
+    url.pathname === "/apple-touch-icon.png" ||
+    url.pathname === "/apple-touch-icon-precomposed.png" ||
+    url.pathname === "/logo.ico" ||
+    url.pathname === "/logo.png" ||
+    url.pathname === "/logo-180.png" ||
+    url.pathname === "/logo-192.png" ||
+    url.pathname === "/logo-512.png"
+  ) {
+    event.respondWith(fetch(request));
+    return;
+  }
 
   // For navigations, prefer network to avoid serving stale HTML across deploys.
   if (request.mode === "navigate") {
