@@ -12,6 +12,12 @@ AUTH_SECRET="<long random string>"
 
 # optional
 MONGODB_DB="caliche-cards"
+
+# optional: Guest/Test mode demo account (for logged-out users)
+# Use either the Mongo ObjectId string or the username.
+GUEST_DEMO_USER_ID="<mongo objectid>"
+# or
+GUEST_DEMO_USERNAME="test"
 ```
 
 Generate a secure `AUTH_SECRET` (macOS):

@@ -12,6 +12,7 @@ export type LibraryItem = {
   deck: StoredDeckMeta;
   selectedDeckId: number | null;
   savedAt: number;
+  source?: "guest";
 };
 
 type StoredState = {

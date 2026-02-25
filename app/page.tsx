@@ -189,11 +189,23 @@ async function downloadMediaBlobFromCloud(
     const ctrl = new AbortController();
     const t = window.setTimeout(() => ctrl.abort(), 30_000);
     try {
-      const url = `/api/sync/media/download?libraryId=${encodeURIComponent(
-        safeLibraryId
-      )}&name=${encodeURIComponent(safeName)}`;
-      const res = await fetch(url, { method: "GET", signal: ctrl.signal });
-      if (res.status === 401) return null;
+      const url = (base: "/api/sync" | "/api/guest") =>
+        `${base}/media/download?libraryId=${encodeURIComponent(
+          safeLibraryId
+        )}&name=${encodeURIComponent(safeName)}`;
+
+      const res = await fetch(url("/api/sync"), { method: "GET", signal: ctrl.signal });
+      if (res.status === 401) {
+        const guestRes = await fetch(url("/api/guest"), {
+          method: "GET",
+          signal: ctrl.signal,
+        });
+        if (!guestRes.ok) return null;
+        const blob = await guestRes.blob();
+        if (!blob || blob.size <= 0) return null;
+        return blob;
+      }
+
       if (!res.ok) return null;
       const blob = await res.blob();
       if (!blob || blob.size <= 0) return null;
@@ -858,6 +870,8 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [authUser, setAuthUser] = useState<{ username: string } | null | undefined>(undefined);
+
   const [syncBusy, setSyncBusy] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [syncProgress, setSyncProgress] = useState<
@@ -891,8 +905,17 @@ export default function Home() {
   const pendingAutoSyncKeyRef = useRef<string | null>(null);
   const prevHadReviewCardRef = useRef(false);
 
+  // Auto-load demo decks once when in Guest/Test mode.
+  const attemptedGuestAutoLoadRef = useRef(false);
+
+  // Auto-sync once after login.
+  const attemptedPostLoginSyncRef = useRef(false);
+
   const onSyncFromCloudRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(onSyncFromCloud);
   onSyncFromCloudRef.current = onSyncFromCloud;
+
+  const onLoadDemoDecksRef = useRef<() => Promise<void>>(onLoadDemoDecks);
+  onLoadDemoDecksRef.current = onLoadDemoDecks;
 
   useEffect(() => {
     (async () => {
@@ -912,6 +935,96 @@ export default function Home() {
       }
     })();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch("/api/auth/me", { cache: "no-store" });
+        const data: unknown = await res.json().catch(() => null);
+        const user = (() => {
+          if (!data || typeof data !== "object") return null;
+          if (!("user" in data)) return null;
+          const raw = (data as { user?: unknown }).user;
+          if (raw == null) return null;
+          if (!raw || typeof raw !== "object") return null;
+          const username = (raw as { username?: unknown }).username;
+          if (typeof username !== "string" || !username.trim()) return null;
+          return { username };
+        })();
+        if (!cancelled) setAuthUser(user);
+      } catch {
+        if (!cancelled) setAuthUser(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const isGuestMode = authUser === null;
+
+  // If the user logs in, hide any previously-loaded guest/demo libraries.
+  useEffect(() => {
+    if (!authUser) return;
+    if (libraries.length === 0) return;
+    const hasGuest = libraries.some((l) => (l as { source?: unknown }).source === "guest");
+    if (!hasGuest) return;
+
+    const nextLibraries = libraries.filter((l) => (l as { source?: unknown }).source !== "guest");
+    const nextActive = nextLibraries.some((l) => l.id === activeLibraryId)
+      ? activeLibraryId
+      : (nextLibraries[0]?.id ?? null);
+
+    setLibraries(nextLibraries);
+    setActiveLibraryId(nextActive);
+    void saveLastState({
+      libraries: nextLibraries,
+      activeLibraryId: nextActive,
+      savedAt: Date.now(),
+      lastSyncAt,
+    });
+  }, [authUser, libraries, activeLibraryId, lastSyncAt]);
+
+  const uiLibraries = useMemo(() => {
+    if (authUser) {
+      return libraries.filter((l) => (l as { source?: unknown }).source !== "guest");
+    }
+    return libraries;
+  }, [authUser, libraries]);
+
+  useEffect(() => {
+    if (!authUser) {
+      attemptedPostLoginSyncRef.current = false;
+      return;
+    }
+    if (attemptedPostLoginSyncRef.current) return;
+    if (busy || syncBusy) return;
+
+    // Wait for any guest/demo decks to be cleaned up before syncing.
+    const hasGuest = libraries.some((l) => (l as { source?: unknown }).source === "guest");
+    if (hasGuest) return;
+
+    attemptedPostLoginSyncRef.current = true;
+    void onSyncFromCloudRef.current({ silent: true });
+  }, [authUser, libraries, busy, syncBusy]);
+
+  useEffect(() => {
+    if (!isGuestMode) {
+      attemptedGuestAutoLoadRef.current = false;
+      return;
+    }
+    if (attemptedGuestAutoLoadRef.current) return;
+    if (busy || syncBusy) return;
+    const hasGuestAlready = libraries.some((l) => (l as { source?: unknown }).source === "guest");
+    if (hasGuestAlready) {
+      attemptedGuestAutoLoadRef.current = true;
+      return;
+    }
+
+    attemptedGuestAutoLoadRef.current = true;
+    void onLoadDemoDecksRef.current();
+  }, [isGuestMode, libraries, busy, syncBusy]);
 
   type DeckDataEnvelopeV1 = {
     version: 1;
@@ -1471,17 +1584,33 @@ export default function Home() {
     const ok = confirm("Are you sure you want to log out?");
     if (!ok) return;
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      try {
+        await onSyncFromCloudRef.current({ silent: true });
+      } catch {
+        // ignore
+      }
+
+      try {
+        await onClearSaved();
+      } catch {
+        // ignore
+      }
+
+      try {
+        await fetch("/api/auth/logout", { method: "POST" });
+      } catch {
+        // ignore
+      }
     } finally {
       window.location.href = "/login";
     }
   }, []);
 
   const activeLibrary = useMemo(() => {
-    if (libraries.length === 0) return null;
-    const found = libraries.find((l) => l.id === activeLibraryId);
-    return found ?? libraries[0] ?? null;
-  }, [libraries, activeLibraryId]);
+    if (uiLibraries.length === 0) return null;
+    const found = uiLibraries.find((l) => l.id === activeLibraryId);
+    return found ?? uiLibraries[0] ?? null;
+  }, [uiLibraries, activeLibraryId]);
 
   const activeNamespace = activeLibrary?.id ?? "default";
   const activeDeck = activeLibrary?.deck ?? null;
@@ -1520,6 +1649,7 @@ export default function Home() {
 
       // Best-effort: persist this deck to the user's cloud DB.
       void (async () => {
+        if (!authUser) return;
         try {
           await uploadDeckDataToCloud({ libraryId: id, name, deck: imported });
 
@@ -1551,6 +1681,138 @@ export default function Home() {
       setError(msg);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function onLoadDemoDecks() {
+    setError(null);
+    setSyncBusy(true);
+    setSyncProgress({ done: 0, total: 1, phase: "Listing demo decks…" });
+    try {
+      const res = await fetchWithTimeout(
+        "/api/guest/list",
+        { cache: "no-store" },
+        30_000,
+        "Guest list"
+      );
+
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg = (() => {
+          if (!data || typeof data !== "object") return null;
+          if (!("error" in data)) return null;
+          const err = (data as { error?: unknown }).error;
+          return typeof err === "string" ? err : null;
+        })();
+        throw new Error(msg ?? "Failed to list demo decks");
+      }
+
+      const libs = (() => {
+        if (!data || typeof data !== "object") return [];
+        if (!("libraries" in data)) return [];
+        const raw = (data as { libraries?: unknown }).libraries;
+        if (!Array.isArray(raw)) return [];
+        return raw
+          .map((x) => {
+            if (!x || typeof x !== "object") return null;
+            const libraryId = (x as { libraryId?: unknown }).libraryId;
+            const name = (x as { name?: unknown }).name;
+            const originalFilename = (x as { originalFilename?: unknown }).originalFilename;
+            if (typeof libraryId !== "string" || typeof name !== "string") return null;
+            return {
+              libraryId,
+              name,
+              originalFilename:
+                typeof originalFilename === "string" ? originalFilename : "deck.apkg",
+            };
+          })
+          .filter(
+            (x): x is { libraryId: string; name: string; originalFilename: string } =>
+              Boolean(x)
+          );
+      })();
+
+      if (libs.length === 0) {
+        setSyncProgress({ done: 1, total: 1, phase: "No demo decks found." });
+        return;
+      }
+
+      const localById = new Map(libraries.map((l) => [l.id, l] as const));
+      const toDownload = libs.filter((l) => !localById.has(l.libraryId));
+
+      const totalSteps = 1 + Math.max(1, toDownload.length) * 2;
+      setSyncProgress({ done: 1, total: totalSteps, phase: "Loading demo decks…" });
+
+      const advance = (phase: string) => {
+        setSyncProgress((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            done: Math.min(prev.total, prev.done + 1),
+            phase,
+          };
+        });
+      };
+
+      const importedItems: LibraryItem[] = [];
+      for (const lib of toDownload) {
+        advance(`Downloading “${lib.name}”…`);
+        const dl = await fetchWithTimeout(
+          `/api/guest/download-deck?libraryId=${encodeURIComponent(lib.libraryId)}`,
+          { cache: "no-store" },
+          120_000,
+          "Guest download"
+        );
+
+        if (!dl.ok) {
+          const errData: unknown = await dl.json().catch(() => null);
+          const msg = (() => {
+            if (!errData || typeof errData !== "object") return null;
+            if (!("error" in errData)) return null;
+            const err = (errData as { error?: unknown }).error;
+            return typeof err === "string" ? err : null;
+          })();
+          throw new Error(msg ?? `Failed to download “${lib.name}”`);
+        }
+
+        const blob = await dl.blob();
+        const deck = await decodeDeckDataBlob(blob);
+        advance(`Importing “${lib.name}”…`);
+        const item = await importDeckDataAsLibrary({
+          libraryId: lib.libraryId,
+          libraryName: lib.name,
+          deck,
+        });
+        importedItems.push({ ...item, source: "guest" } as LibraryItem);
+      }
+
+      if (importedItems.length > 0) {
+        setLibraries((prev) => {
+          const next = [...prev, ...importedItems];
+          void saveLastState({
+            libraries: next,
+            activeLibraryId: activeLibraryId ?? importedItems[0]?.id ?? null,
+            savedAt: Date.now(),
+            lastSyncAt,
+          });
+          return next;
+        });
+        if (!activeLibraryId) {
+          setActiveLibraryId(importedItems[0]?.id ?? null);
+        }
+      }
+
+      setSyncProgress({
+        done: totalSteps,
+        total: totalSteps,
+        phase: "Demo decks loaded.",
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to load demo decks";
+      setError(msg);
+    } finally {
+      setSyncBusy(false);
+      window.setTimeout(() => setSyncProgress(null), 1_500);
     }
   }
 
@@ -2775,6 +3037,11 @@ export default function Home() {
   }, [mode]);
 
   useEffect(() => {
+    if (isGuestMode) {
+      prevHadReviewCardRef.current = false;
+      pendingAutoSyncKeyRef.current = null;
+      return;
+    }
     if (mode !== "review") {
       prevHadReviewCardRef.current = false;
       pendingAutoSyncKeyRef.current = null;
@@ -2804,7 +3071,7 @@ export default function Home() {
     lastAutoSyncKeyRef.current = pendingKey;
     pendingAutoSyncKeyRef.current = null;
     void onSyncFromCloudRef.current({ silent: true });
-  }, [mode, current, reviewRef, syncBusy, busy, reviewBusy]);
+  }, [isGuestMode, mode, current, reviewRef, syncBusy, busy, reviewBusy]);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -2819,48 +3086,80 @@ export default function Home() {
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
-            <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
-              Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
-            </div>
+            {authUser ? (
+              <>
+                <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+                  Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
+                </div>
 
-            {syncBusy && syncProgress ? (
-              <div className="max-w-55 truncate text-xs text-foreground/60" title={syncProgress.phase}>
-                {syncProgress.phase}
+                {syncBusy && syncProgress ? (
+                  <div className="max-w-55 truncate text-xs text-foreground/60" title={syncProgress.phase}>
+                    {syncProgress.phase}
+                  </div>
+                ) : null}
+
+                <button
+                  type="button"
+                  className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                  onClick={() => void onSyncFromCloud()}
+                  disabled={syncBusy || busy}
+                  title={
+                    syncBusy && syncProgress
+                      ? syncProgress.phase
+                      : "Download your decks from the cloud and rebuild local storage"
+                  }
+                >
+                  {(() => {
+                    if (!syncBusy) return "Sync";
+                    const total = syncProgress?.total ?? 1;
+                    const done = syncProgress?.done ?? 0;
+                    const pct = Math.max(
+                      0,
+                      Math.min(100, Math.floor((done / Math.max(1, total)) * 100))
+                    );
+                    return `Syncing… ${pct}%`;
+                  })()}
+                </button>
+
+                <button
+                  type="button"
+                  className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                  onClick={onLogout}
+                >
+                  Logout
+                </button>
+              </>
+            ) : authUser === null ? (
+              <>
+                <div className="rounded-full border border-foreground/30 bg-foreground/5 px-3 py-2 text-xs font-semibold uppercase tracking-wide">
+                  Guest / Test mode
+                </div>
+                <button
+                  type="button"
+                  className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                  onClick={() => void onLoadDemoDecks()}
+                  disabled={syncBusy || busy}
+                  title="Load demo decks from the test account"
+                >
+                  {syncBusy ? "Loading…" : "Load demo decks"}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                  onClick={() => {
+                    window.location.href = "/login";
+                  }}
+                >
+                  Log in
+                </button>
+              </>
+            ) : (
+              <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+                Checking session…
               </div>
-            ) : null}
+            )}
 
-            <button
-              type="button"
-              className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
-              onClick={() => void onSyncFromCloud()}
-              disabled={syncBusy || busy}
-              title={
-                syncBusy && syncProgress
-                  ? syncProgress.phase
-                  : "Download your decks from the cloud and rebuild local storage"
-              }
-            >
-              {(() => {
-                if (!syncBusy) return "Sync";
-                const total = syncProgress?.total ?? 1;
-                const done = syncProgress?.done ?? 0;
-                const pct = Math.max(
-                  0,
-                  Math.min(100, Math.floor((done / Math.max(1, total)) * 100))
-                );
-                return `Syncing… ${pct}%`;
-              })()}
-            </button>
-
-            <button
-              type="button"
-              className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
-              onClick={onLogout}
-            >
-              Logout
-            </button>
-
-            {libraries.length > 0 ? (
+            {uiLibraries.length > 0 ? (
               <button
                 type="button"
                 className="rounded-full border border-foreground/15 px-4 py-2 text-sm text-foreground/70 hover:bg-foreground/5 hover:text-foreground"
@@ -2871,6 +3170,15 @@ export default function Home() {
             ) : null}
           </div>
         </header>
+
+        {authUser === null ? (
+          <div className="rounded-2xl border border-foreground/30 bg-foreground/5 px-4 py-3 text-sm">
+            <div className="font-semibold uppercase tracking-wide">Guest / Test mode</div>
+            <div className="mt-1 text-foreground/70">
+              You’re viewing demo decks from a test account. Your progress stays on this device only.
+            </div>
+          </div>
+        ) : null}
 
         {error ? (
           <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-3 text-sm">
@@ -2905,7 +3213,7 @@ export default function Home() {
                 />
               </div>
 
-              {libraries.length === 0 ? (
+              {uiLibraries.length === 0 ? (
                 <p className="text-sm text-foreground/70">
                   Import an <span className="font-medium">.apkg</span> to
                   see your decks here. They are saved locally so you can keep
@@ -2923,7 +3231,7 @@ export default function Home() {
                   </div>
 
                   <div className="divide-y divide-foreground/10">
-                    {libraries.flatMap((lib) => {
+                    {uiLibraries.flatMap((lib) => {
                       return lib.deck.decks.map((d) => {
                         const depth = Math.max(
                           0,

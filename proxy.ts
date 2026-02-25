@@ -2,11 +2,12 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { getSessionCookieName, verifySessionToken } from "@/lib/session";
 
-const PUBLIC_PATHS = new Set<string>(["/login", "/register"]);
+const PUBLIC_PATHS = new Set<string>(["/", "/login", "/register"]);
 
 function isPublicPath(pathname: string): boolean {
   if (PUBLIC_PATHS.has(pathname)) return true;
   if (pathname.startsWith("/api/auth/")) return true;
+  if (pathname.startsWith("/api/guest/")) return true;
   if (pathname.startsWith("/api/sync/")) return true;
   if (pathname === "/api/auth") return true;
   return false;

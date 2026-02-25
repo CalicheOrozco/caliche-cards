@@ -1,5 +1,7 @@
 import Link from "next/link";
 
+import LoginAutoClear from "./_components/LoginAutoClear";
+
 type SearchParams = {
   error?: string | string[];
   next?: string | string[];
@@ -36,6 +38,7 @@ export default async function LoginPage({
 
   return (
     <div className="min-h-screen bg-background text-foreground">
+      <LoginAutoClear />
       <div className="mx-auto flex w-full max-w-md flex-col gap-6 px-5 py-10">
         <header>
           <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>

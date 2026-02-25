@@ -3,7 +3,7 @@ import type { MetadataRoute } from "next";
 export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "Caliche Cards",
-    short_name: "Cards",
+    short_name: "Caliche Cards",
     description:
       "Offline-first flashcards for importing Anki decks (.apkg) and studying with simple Fail/Pass reviews.",
     id: "/",
