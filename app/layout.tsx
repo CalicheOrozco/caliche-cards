@@ -18,6 +18,9 @@ export const metadata: Metadata = {
   description: "Anki-style PWA for reviewing flashcards.",
   applicationName: "Caliche Cards",
   manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [{ url: "/logo.ico", type: "image/x-icon" }],
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
