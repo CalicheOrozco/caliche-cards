@@ -19,7 +19,13 @@ export async function proxy(req: NextRequest) {
   // Allow public assets and Next internals.
   if (
     pathname.startsWith("/_next/") ||
+    // Public/static assets (e.g. PWA icons) should never require auth.
+    /\/[^/]+\.[a-z0-9]+$/i.test(pathname) ||
     pathname === "/logo.ico" ||
+    pathname === "/logo.png" ||
+    pathname === "/logo-192.png" ||
+    pathname === "/logo-512.png" ||
+    pathname === "/logo-180.png" ||
     pathname === "/icon" ||
     pathname === "/apple-icon" ||
     pathname === "/manifest.webmanifest" ||
