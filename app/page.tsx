@@ -870,10 +870,15 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const devPurgeEnabled =
+    process.env.NODE_ENV !== "production" &&
+    /^(1|true)$/i.test(String(process.env.NEXT_PUBLIC_ENABLE_DEV_PURGE || ""));
+
   const [authUser, setAuthUser] = useState<{ username: string } | null | undefined>(undefined);
 
   const [syncBusy, setSyncBusy] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [lastPushAtLocal, setLastPushAtLocal] = useState<number | null>(null);
   const [syncProgress, setSyncProgress] = useState<
     | {
         done: number;
@@ -911,6 +916,10 @@ export default function Home() {
   // Auto-sync once after login.
   const attemptedPostLoginSyncRef = useRef(false);
 
+  // Prevent slow/stale async updates when rapidly advancing cards.
+  const loadNextSeqRef = useRef(0);
+  const lastOverviewRefreshAtRef = useRef(0);
+
   const onSyncFromCloudRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(onSyncFromCloud);
   onSyncFromCloudRef.current = onSyncFromCloud;
 
@@ -930,6 +939,11 @@ export default function Home() {
         setLibraries(state.libraries ?? []);
         setActiveLibraryId(state.activeLibraryId ?? null);
         setLastSyncAt(state.lastSyncAt ?? null);
+        setLastPushAtLocal(() => {
+          const raw = (state as { lastPushAtLocal?: unknown }).lastPushAtLocal;
+          const n = typeof raw === "number" ? raw : Number(raw);
+          return Number.isFinite(n) && n > 0 ? n : null;
+        });
       } catch {
         // ignore
       }
@@ -983,8 +997,9 @@ export default function Home() {
       activeLibraryId: nextActive,
       savedAt: Date.now(),
       lastSyncAt,
+      lastPushAtLocal,
     });
-  }, [authUser, libraries, activeLibraryId, lastSyncAt]);
+  }, [authUser, libraries, activeLibraryId, lastSyncAt, lastPushAtLocal]);
 
   const uiLibraries = useMemo(() => {
     if (authUser) {
@@ -1606,6 +1621,166 @@ export default function Home() {
     }
   }, []);
 
+  const onDevPurgeOtherUsers = useCallback(async () => {
+    if (!devPurgeEnabled) return;
+    if (!authUser) return;
+
+    const typed = window.prompt(
+      "DEV ONLY. This will delete all cloud data for OTHER userIds (and then delete unreferenced media files).\n\nType PURGE_OTHER_USERS to confirm."
+    );
+    if (typed !== "PURGE_OTHER_USERS") return;
+
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/admin/purge-other-users", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirm: "PURGE_OTHER_USERS" }),
+      });
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg =
+          data && typeof data === "object" && "error" in data
+            ? String((data as { error?: unknown }).error ?? "Purge failed")
+            : "Purge failed";
+        throw new Error(msg);
+      }
+
+      const deleted =
+        data && typeof data === "object" && "deletedGridFsFiles" in data
+          ? (data as { deletedGridFsFiles?: unknown }).deletedGridFsFiles
+          : null;
+
+      window.alert(
+        `Purge complete.\n\nGridFS deleted:\n${JSON.stringify(deleted, null, 2)}`
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Purge failed";
+      setError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }, [devPurgeEnabled, authUser]);
+
+  const onDevResetMyCloud = useCallback(async () => {
+    if (!devPurgeEnabled) return;
+    if (!authUser) return;
+
+    const typed = window.prompt(
+      "DEV ONLY. This will DELETE ALL your cloud data (libraries, progress, and media) for your current user.\n\nYour local data stays. After this, click Sync to re-upload from this device.\n\nType RESET_MY_CLOUD to confirm."
+    );
+    if (typed !== "RESET_MY_CLOUD") return;
+
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/admin/reset-my-cloud", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirm: "RESET_MY_CLOUD" }),
+      });
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg =
+          data && typeof data === "object" && "error" in data
+            ? String((data as { error?: unknown }).error ?? "Reset failed")
+            : "Reset failed";
+        throw new Error(msg);
+      }
+
+      const deleted =
+        data && typeof data === "object" && "deletedGridFsFiles" in data
+          ? (data as { deletedGridFsFiles?: unknown }).deletedGridFsFiles
+          : null;
+
+      window.alert(
+        `Cloud reset complete.\n\nGridFS deleted:\n${JSON.stringify(deleted, null, 2)}\n\nNow click Sync to re-upload from this device.`
+      );
+
+      // IMPORTANT: after cloud reset, force a full progress push next sync.
+      // Otherwise, lastSyncAt might cause the client to skip uploading older local progress.
+      setLastSyncAt(null);
+      setLastPushAtLocal(null);
+      void saveLastState({
+        libraries,
+        activeLibraryId,
+        savedAt: Date.now(),
+        lastSyncAt: null,
+        lastPushAtLocal: null,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Reset failed";
+      setError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }, [devPurgeEnabled, authUser, libraries, activeLibraryId]);
+
+  const onDevDebugLocalProgress = useCallback(async () => {
+    if (!devPurgeEnabled) return;
+
+    try {
+      const db = getStudyDb();
+      const MAX_TS = Number.MAX_SAFE_INTEGER;
+
+      const rows: Array<{
+        libraryId: string;
+        name: string;
+        cardStatesTotal: number;
+        cardStatesUpdated: number;
+        reviewLogsTotal: number;
+        decksTotal: number;
+      }> = [];
+
+      for (const lib of uiLibraries) {
+        const cardStatesTotal = await db.cardStates.where("libraryId").equals(lib.id).count();
+        const cardStatesUpdated = await db.cardStates
+          .where("[libraryId+updatedAt]")
+          .between([lib.id, 1], [lib.id, MAX_TS], true, true)
+          .count();
+        const reviewLogsTotal = await db.reviewLogs.where("libraryId").equals(lib.id).count();
+        const decksTotal = await db.decks.where("libraryId").equals(lib.id).count();
+
+        rows.push({
+          libraryId: lib.id,
+          name: lib.name,
+          cardStatesTotal,
+          cardStatesUpdated,
+          reviewLogsTotal,
+          decksTotal,
+        });
+      }
+
+      window.alert(`Local progress snapshot:\n\n${JSON.stringify(rows, null, 2)}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Debug failed";
+      setError(msg);
+    }
+  }, [devPurgeEnabled, uiLibraries]);
+
+  const onDevDebugCloudProgress = useCallback(async () => {
+    if (!devPurgeEnabled) return;
+    if (!authUser) return;
+
+    try {
+      const res = await fetch("/api/admin/debug-my-cloud-progress", { cache: "no-store" });
+      const data: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg =
+          data && typeof data === "object" && "error" in data
+            ? String((data as { error?: unknown }).error ?? "Debug failed")
+            : "Debug failed";
+        throw new Error(msg);
+      }
+
+      window.alert(`Cloud progress snapshot:\n\n${JSON.stringify(data, null, 2)}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Debug failed";
+      setError(msg);
+    }
+  }, [devPurgeEnabled, authUser]);
+
   const activeLibrary = useMemo(() => {
     if (uiLibraries.length === 0) return null;
     const found = uiLibraries.find((l) => l.id === activeLibraryId);
@@ -1663,6 +1838,7 @@ export default function Home() {
 
           const ts = Date.now();
           setLastSyncAt(ts);
+          setLastPushAtLocal(ts);
           const { state } = await loadLastState();
           if (state) {
             await saveLastState({
@@ -1670,6 +1846,7 @@ export default function Home() {
               activeLibraryId: state.activeLibraryId,
               savedAt: Date.now(),
               lastSyncAt: ts,
+              lastPushAtLocal: ts,
             });
           }
         } catch {
@@ -2035,31 +2212,79 @@ export default function Home() {
       // Sync study progress (card states + review logs) bidirectionally.
       // Use cloud time (uploadedAt/serverTime) for incremental pulls.
       // Subtract 1ms to avoid missing entries exactly on the boundary.
-      const since = Math.max(0, (lastSyncAt ?? 0) - 1);
-      let maxServerTime = since;
+      // Use server time for pull (cloud writes use uploadedAt/serverTime).
+      const sincePull = Math.max(0, (lastSyncAt ?? 0) - 1);
+      let maxServerTime = sincePull;
+
+      // Use local time for push (local writes use Date.now()) to avoid clock-skew.
+      const sincePush = Math.max(0, (lastPushAtLocal ?? 0) - 1);
       const db = getStudyDb();
       const MAX_TS = Number.MAX_SAFE_INTEGER;
 
       for (const lib of mergedLibraries) {
         setPhase(`Preparing progress for “${lib.name}”…`);
         // Pull deckIds from local metadata for efficient IndexedDB queries.
-        const deckIds = lib.deck?.decks?.map((d) => d.id) ?? [];
+        // If the in-memory deck isn't present, fall back to IndexedDB.
+        const deckIdsFromLib = lib.deck?.decks?.map((d) => d.id) ?? [];
+        const deckIds =
+          deckIdsFromLib.length > 0
+            ? deckIdsFromLib
+            : (await db.decks.where("libraryId").equals(lib.id).toArray()).map((d) => d.deckId);
+
+        // Backfill missing timestamps for older local rows.
+        // If `updatedAt` is missing, IndexedDB compound-index queries won't return the row,
+        // causing an empty push even though local progress exists.
+        if (sincePush === 0) {
+          await db.transaction("rw", db.decks, db.cardStates, async () => {
+            await db.decks
+              .where("libraryId")
+              .equals(lib.id)
+              .modify((d) => {
+                const row = d as unknown as { updatedAt?: unknown; createdAt?: unknown };
+                if (typeof row.updatedAt !== "number" || !Number.isFinite(row.updatedAt)) {
+                  (d as unknown as { updatedAt: number }).updatedAt = 0;
+                }
+                if (typeof row.createdAt !== "number" || !Number.isFinite(row.createdAt)) {
+                  (d as unknown as { createdAt: number }).createdAt = 0;
+                }
+              });
+
+            await db.cardStates
+              .where("libraryId")
+              .equals(lib.id)
+              .modify((s) => {
+                const row = s as unknown as { updatedAt?: unknown; createdAt?: unknown };
+                if (typeof row.updatedAt !== "number" || !Number.isFinite(row.updatedAt)) {
+                  (s as unknown as { updatedAt: number }).updatedAt = 0;
+                }
+                if (typeof row.createdAt !== "number" || !Number.isFinite(row.createdAt)) {
+                  (s as unknown as { createdAt: number }).createdAt = 0;
+                }
+              });
+          });
+        }
 
         const deckConfigs = await db.decks
           .where("[libraryId+updatedAt]")
-          .between([lib.id, since], [lib.id, MAX_TS], false, true)
+          .between([lib.id, sincePush], [lib.id, MAX_TS], true, true)
           .toArray();
 
         const cardStates = await db.cardStates
           .where("[libraryId+updatedAt]")
-          .between([lib.id, since], [lib.id, MAX_TS], false, true)
+          .between([lib.id, sincePush], [lib.id, MAX_TS], true, true)
           .toArray();
+
+        // Never upload seeded states (updatedAt=0). Those are not real progress and
+        // can cause duplicate-key write errors on new devices (cloud already has rows).
+        const cardStatesForPush = cardStates.filter(
+          (s) => typeof (s as { updatedAt?: unknown }).updatedAt === "number" && (s as { updatedAt: number }).updatedAt > 0
+        );
 
         const reviewLogs: LocalReviewLogRow[] = [];
         for (const deckId of deckIds) {
           const batch = await db.reviewLogs
             .where("[libraryId+deckId+ts]")
-            .between([lib.id, deckId, since], [lib.id, deckId, MAX_TS], false, true)
+            .between([lib.id, deckId, sincePush], [lib.id, deckId, MAX_TS], true, true)
             .toArray();
           reviewLogs.push(...(batch as unknown as LocalReviewLogRow[]));
         }
@@ -2136,9 +2361,11 @@ export default function Home() {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               libraryId: lib.id,
-              cardStates,
+              cardStates: cardStatesForPush,
               reviewLogs: reviewLogsForPush,
-              deckConfigs: deckConfigs.map((d) => ({
+              deckConfigs: deckConfigs
+                .filter((d) => typeof (d as { updatedAt?: unknown }).updatedAt === "number" && (d as { updatedAt: number }).updatedAt > 0)
+                .map((d) => ({
                 libraryId: d.libraryId,
                 deckId: d.deckId,
                 newPerDay: d.newPerDay,
@@ -2163,13 +2390,36 @@ export default function Home() {
           throw new Error(msg ?? "Failed to sync progress to cloud");
         }
 
-        advance(`Pushed progress for “${lib.name}”.`);
+        if (devPurgeEnabled) {
+          const pushData: unknown = await pushRes.json().catch(() => null);
+          const received = (() => {
+            if (!pushData || typeof pushData !== "object") return null;
+            const raw = (pushData as { received?: unknown }).received;
+            if (!raw || typeof raw !== "object") return null;
+            const cs = (raw as { cardStates?: unknown }).cardStates;
+            const rl = (raw as { reviewLogs?: unknown }).reviewLogs;
+            return {
+              cardStates: typeof cs === "number" ? cs : Number(cs),
+              reviewLogs: typeof rl === "number" ? rl : Number(rl),
+            };
+          })();
+
+          if (received && Number.isFinite(received.cardStates) && Number.isFinite(received.reviewLogs)) {
+            advance(
+              `Pushed progress for “${lib.name}”. (server received: ${received.cardStates} states, ${received.reviewLogs} logs)`
+            );
+          } else {
+            advance(`Pushed progress for “${lib.name}”.`);
+          }
+        } else {
+          advance(`Pushed progress for “${lib.name}”.`);
+        }
 
         // Pull remote changes since last sync.
         setPhase(`Pulling progress for “${lib.name}”…`);
         const pullRes = await fetchWithTimeout(
           `/api/sync/progress/pull?libraryId=${encodeURIComponent(lib.id)}&since=${encodeURIComponent(
-            String(since)
+            String(sincePull)
           )}`,
           { cache: "no-store" },
           120_000,
@@ -2389,13 +2639,16 @@ export default function Home() {
       }
 
       setPhase("Finalizing sync…");
-      const ts = Math.max(Date.now(), maxServerTime);
-      setLastSyncAt(ts);
+      const serverTs = maxServerTime;
+      const localTs = Date.now();
+      setLastSyncAt(serverTs);
+      setLastPushAtLocal(localTs);
       await saveLastState({
         libraries: mergedLibraries,
         activeLibraryId: activeLibraryId ?? (mergedLibraries[0]?.id ?? null),
         savedAt: Date.now(),
-        lastSyncAt: ts,
+        lastSyncAt: serverTs,
+        lastPushAtLocal: localTs,
       });
 
       advance("Sync complete.");
@@ -2424,6 +2677,7 @@ export default function Home() {
     setLibraries([]);
     setActiveLibraryId(null);
     setLastSyncAt(null);
+    setLastPushAtLocal(null);
     setMode("import");
     setShowAnswer(false);
     setReviewRef(null);
@@ -2850,18 +3104,37 @@ export default function Home() {
   );
 
   async function loadNext(ref: DeckRef, excludeCardId?: number) {
-    const [next, ov] = await Promise.all([
-      getNextCard(ref, {
-        learnAheadMs: 60 * 60 * 1000,
-        learnAheadMode: "learn+relearn",
-        excludeCardId,
-      }),
-      getDeckOverview(ref),
-    ]);
+    // Show the next card ASAP; refresh overview in the background.
+    const seq = (loadNextSeqRef.current += 1);
+    const key = `${ref.libraryId}:${ref.deckId}`;
+
+    const nextPromise = getNextCard(ref, {
+      learnAheadMs: 60 * 60 * 1000,
+      learnAheadMode: "learn+relearn",
+      excludeCardId,
+    });
+
+    const next = await nextPromise;
+    if (loadNextSeqRef.current !== seq) return;
     setCurrent(next);
-    setReviewOverview(ov);
-    setDeckOverviews((prev) => ({ ...prev, [`${ref.libraryId}:${ref.deckId}`]: ov }));
     setShowAnswer(false);
+
+    // Avoid heavy overview scans on every card; it can stall the UI.
+    // Refresh occasionally (and always when we run out of cards).
+    const now = Date.now();
+    const shouldRefreshOverview = next == null || now - lastOverviewRefreshAtRef.current > 1500;
+    if (!shouldRefreshOverview) return;
+    lastOverviewRefreshAtRef.current = now;
+
+    void getDeckOverview(ref)
+      .then((ov) => {
+        if (loadNextSeqRef.current !== seq) return;
+        setReviewOverview(ov);
+        setDeckOverviews((prev) => ({ ...prev, [key]: ov }));
+      })
+      .catch(() => {
+        // Ignore: overview is best-effort UI state.
+      });
   }
 
   // Keep a lightweight clock for countdown UI.
@@ -2896,8 +3169,9 @@ export default function Home() {
 
     const ref: DeckRef = { libraryId, deckId };
     try {
-      const ov = await getDeckOverview(ref);
-      if (ov.total === 0) {
+      const db = getStudyDb();
+      const cardsCount = await db.cards.where("[libraryId+deckId]").equals([libraryId, deckId]).count();
+      if (cardsCount === 0) {
         setError("That deck has no cards.");
         return;
       }
@@ -2907,8 +3181,15 @@ export default function Home() {
 
       setReviewRef(ref);
       setMode("review");
-      await startStudySession(ref);
+
+      // Show the first card ASAP. `startStudySession` can be expensive (it scans
+      // card states to unbury), so run it in the background.
       await loadNext(ref);
+      window.setTimeout(() => {
+        void startStudySession(ref).catch(() => {
+          // Best-effort cleanup; ignore failures.
+        });
+      }, 0);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Error starting review";
       setError(msg);
@@ -2983,6 +3264,12 @@ export default function Home() {
 
   const currentTimingTag = useMemo(() => {
     if (!current) return null;
+
+    const isNew = current.state?.state === "new";
+    if (isNew) {
+      return { kind: "new" as const, label: "New", detail: null };
+    }
+
     const due = typeof current.state?.due === "number" ? current.state.due : 0;
     if (!Number.isFinite(due)) return { kind: "due", label: "Due", detail: null };
     const isWaiting = due > nowTs;
@@ -3120,6 +3407,54 @@ export default function Home() {
                     return `Syncing… ${pct}%`;
                   })()}
                 </button>
+
+                {devPurgeEnabled ? (
+                  <button
+                    type="button"
+                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                    onClick={onDevPurgeOtherUsers}
+                    disabled={busy || syncBusy}
+                    title="DEV ONLY: purge other userIds from MongoDB"
+                  >
+                    Purge other users
+                  </button>
+                ) : null}
+
+                {devPurgeEnabled ? (
+                  <button
+                    type="button"
+                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                    onClick={onDevResetMyCloud}
+                    disabled={busy || syncBusy}
+                    title="DEV ONLY: delete ALL cloud data for your current user"
+                  >
+                    Reset my cloud
+                  </button>
+                ) : null}
+
+                {devPurgeEnabled ? (
+                  <button
+                    type="button"
+                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                    onClick={onDevDebugLocalProgress}
+                    disabled={busy || syncBusy}
+                    title="DEV ONLY: show local progress counts"
+                  >
+                    Debug local progress
+                  </button>
+                ) : null}
+
+                {devPurgeEnabled ? (
+                  <button
+                    type="button"
+                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                    onClick={onDevDebugCloudProgress}
+                    disabled={busy || syncBusy}
+                    title="DEV ONLY: show cloud progress counts for the current user"
+                  >
+                    Debug cloud progress
+                  </button>
+                ) : null}
 
                 <button
                   type="button"
@@ -3537,7 +3872,7 @@ export default function Home() {
                     {selectedDeckName ?? "(unnamed)"}
                   </div>
                   <div className="mt-1 text-xs text-foreground/70">
-                    New/day: {reviewOverview?.config.newPerDay ?? "—"}
+                    New/day: {reviewOverview?.config.newPerDay ?? "—"} • Review/day: {reviewOverview?.config.reviewsPerDay ?? "—"}
                     {reviewOverview
                       ? ` • Words: ${reviewOverview.reviewed}/${reviewOverview.total}`
                       : ""}
@@ -3545,10 +3880,20 @@ export default function Home() {
                 </div>
                 <div className="flex items-center gap-3">
                   <div className="text-sm text-foreground/70">
-                    Due: {reviewOverview ? reviewOverview.newShown + reviewOverview.learningDue + reviewOverview.reviewShown : 0}
-                    {reviewOverview && reviewOverview.learningWaiting > 0
-                      ? ` • Waiting: ${reviewOverview.learningWaiting}`
-                      : ""}
+                    Due:{" "}
+                    {reviewOverview
+                      ? reviewOverview.learningDue + reviewOverview.reviewShown
+                      : 0}
+                    {reviewOverview ? (
+                      <>
+                        {" "}• New: {reviewOverview.newShown}
+                        {" "}• Learning: {reviewOverview.learningDue}
+                        {" "}• Review: {reviewOverview.reviewShown}
+                      </>
+                    ) : null}
+                    {reviewOverview && reviewOverview.learningWaiting > 0 ? (
+                      <> {" "}• Waiting: {reviewOverview.learningWaiting}</>
+                    ) : null}
                   </div>
                   <button
                     type="button"
@@ -3572,7 +3917,15 @@ export default function Home() {
                 <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-foreground/5 p-6">
                   {currentTimingTag ? (
                     <div className="absolute left-4 top-4 text-xs text-foreground/60">
-                      <span className="font-semibold text-foreground">
+                      <span
+                        className={`font-semibold ${
+                          currentTimingTag.kind === "new"
+                            ? "text-blue-400"
+                            : currentTimingTag.kind === "due"
+                              ? "text-yellow-500"
+                              : "text-foreground"
+                        }`}
+                      >
                         {currentTimingTag.label}
                       </span>
                       {currentTimingTag.detail ? (
@@ -3683,7 +4036,7 @@ export default function Home() {
                         );
                       })()
                     ) : (
-                      <>No more cards due (or you hit today’s limits).</>
+                      <>No more cards ready (or you hit today’s limits).</>
                     )}
                   </div>
                 </div>

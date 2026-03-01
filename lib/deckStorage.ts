@@ -20,6 +20,9 @@ type StoredState = {
   libraries: LibraryItem[];
   activeLibraryId: string | null;
   lastSyncAt: number | null;
+  // Local wall-clock time used for incremental *push* selection.
+  // Separate from lastSyncAt (server time) to avoid clock-skew issues.
+  lastPushAtLocal?: number | null;
   savedAt: number;
 };
 
@@ -28,6 +31,7 @@ type StoredStateInput = {
   activeLibraryId: string | null;
   savedAt: number;
   lastSyncAt?: number | null;
+  lastPushAtLocal?: number | null;
 };
 
 export type LoadStateResult = {
@@ -82,10 +86,20 @@ export async function saveLastState(state: StoredStateInput): Promise<void> {
   const lastSyncAt =
     "lastSyncAt" in state ? (state.lastSyncAt ?? null) : (typeof preservedLastSyncAt === "number" ? preservedLastSyncAt : null);
 
+  const preservedLastPushAtLocal =
+    existing && typeof existing === "object" && "lastPushAtLocal" in existing
+      ? (existing as { lastPushAtLocal?: unknown }).lastPushAtLocal
+      : null;
+  const lastPushAtLocal =
+    "lastPushAtLocal" in state
+      ? (state.lastPushAtLocal ?? null)
+      : (typeof preservedLastPushAtLocal === "number" ? preservedLastPushAtLocal : null);
+
   const value: StoredState = {
     ...state,
     schemaVersion: STATE_SCHEMA_VERSION,
     lastSyncAt,
+    lastPushAtLocal,
   };
 
   await db.put("state", value, "last");
@@ -177,7 +191,17 @@ export async function loadLastState(): Promise<LoadStateResult> {
     }
   }
 
-  return { state: value, clearedOld: false };
+  // Normalize optional fields for older records.
+  const normalized: StoredState = {
+    ...(value as StoredState),
+    lastPushAtLocal:
+      typeof (value as { lastPushAtLocal?: unknown }).lastPushAtLocal === "number"
+        ? ((value as { lastPushAtLocal?: number }).lastPushAtLocal ?? null)
+        : null,
+  };
+
+  await db.put("state", normalized, "last");
+  return { state: normalized, clearedOld: false };
 }
 
 export async function clearLastState(): Promise<void> {

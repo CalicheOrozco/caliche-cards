@@ -38,6 +38,36 @@ async function ensureIndexes(db: Db) {
   } catch {
     // ignore
   }
+
+  // Helps global dedupe across accounts.
+  try {
+    await db.collection<CloudMediaDoc>("cloudMedia").createIndex({ sha256: 1, size: 1 });
+  } catch {
+    // ignore
+  }
+
+  // Helps reference counting checks when deleting media files.
+  try {
+    await db.collection<CloudMediaDoc>("cloudMedia").createIndex({ fileId: 1 });
+  } catch {
+    // ignore
+  }
+}
+
+type GridFsFileDoc = {
+  _id: ObjectId;
+};
+
+async function gridFsFileExists(db: Db, fileId: ObjectId): Promise<boolean> {
+  const doc = await db
+    .collection<GridFsFileDoc>("media.files")
+    .findOne({ _id: fileId }, { projection: { _id: 1 } });
+  return Boolean(doc);
+}
+
+async function canDeleteMediaFile(db: Db, fileId: ObjectId): Promise<boolean> {
+  const remainingRefs = await db.collection<CloudMediaDoc>("cloudMedia").countDocuments({ fileId }, { limit: 1 });
+  return remainingRefs === 0;
 }
 
 export async function POST(req: NextRequest) {
@@ -157,6 +187,34 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
+    // Global dedupe across accounts: if any other (user, library, name) already
+    // references identical content (sha256+size), reuse its GridFS fileId.
+    // This saves MongoDB storage because GridFS chunks are the main cost.
+    try {
+      const shared = await db
+        .collection<CloudMediaDoc>("cloudMedia")
+        .find({ sha256, size: Number(size) })
+        .sort({ uploadedAt: -1 })
+        .project({ fileId: 1 })
+        .limit(5)
+        .toArray();
+
+      const sharedFileId =
+        shared.map((d) => d.fileId).find((id) => id && String(id) !== String(fileId)) ?? null;
+
+      if (sharedFileId && (await gridFsFileExists(db, sharedFileId))) {
+        // Replace the just-uploaded file with the shared one.
+        try {
+          await bucket.delete(fileId);
+        } catch {
+          // ignore
+        }
+        fileId = sharedFileId;
+      }
+    } catch {
+      // ignore (dedupe is best-effort)
+    }
+
     try {
       await db.collection<CloudMediaDoc>("cloudMedia").updateOne(
         { userId, libraryId, name: originalName },
@@ -177,7 +235,7 @@ export async function POST(req: NextRequest) {
     } catch (e: unknown) {
       // Avoid orphaning the uploaded file if metadata write fails.
       try {
-        await bucket.delete(fileId);
+        if (await canDeleteMediaFile(db, fileId)) await bucket.delete(fileId);
       } catch {
         // ignore
       }
@@ -189,7 +247,9 @@ export async function POST(req: NextRequest) {
     // Best-effort cleanup of previous GridFS file.
     if (existing && existing.fileId && String(existing.fileId) !== String(fileId)) {
       try {
-        await bucket.delete(existing.fileId);
+        if (await canDeleteMediaFile(db, existing.fileId)) {
+          await bucket.delete(existing.fileId);
+        }
       } catch {
         // ignore
       }
