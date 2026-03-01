@@ -503,30 +503,38 @@ export async function getNextCard(ref: DeckRef, options: GetNextCardOptions = {}
     return { card, state: learn };
   }
 
-  // b) review due (respect daily limit)
-  if (reviewDone < cfg.reviewsPerDay) {
+  // b/c) review + new (both respect daily limits) — interleave instead of exhausting reviews first.
+  const canReview = reviewDone < cfg.reviewsPerDay;
+  const canNew = newDone < cfg.newPerDay;
+
+  const tryPickReview = async (): Promise<NextCard | null> => {
+    if (!canReview) return null;
     const review = await pickDue(ref, "review", now);
-    if (review) {
-      const card = await db.cards.get([ref.libraryId, review.cardId]);
-      if (!card) return null;
-      return { card, state: review };
-    }
-  }
+    if (!review) return null;
+    const card = await db.cards.get([ref.libraryId, review.cardId]);
+    if (!card) return null;
+    return { card, state: review };
+  };
 
-  // c) new (respect daily limit)
-  if (newDone < cfg.newPerDay) {
-    const batch = await db.cardStates
-      .where("[libraryId+deckId+state+due]")
-      .between([ref.libraryId, ref.deckId, "new", 0], [ref.libraryId, ref.deckId, "new", now], true, true)
-      .limit(50)
-      .toArray();
+  const tryPickNew = async (): Promise<NextCard | null> => {
+    if (!canNew) return null;
+    const nextNew = await pickDue(ref, "new", now);
+    if (!nextNew) return null;
+    const card = await db.cards.get([ref.libraryId, nextNew.cardId]);
+    if (!card) return null;
+    return { card, state: nextNew };
+  };
 
-    const nextNew = batch.find((s) => isAvailable(s, now)) ?? null;
-    if (nextNew) {
-      const card = await db.cards.get([ref.libraryId, nextNew.cardId]);
-      if (!card) return null;
-      return { card, state: nextNew };
-    }
+  if (canReview || canNew) {
+    const progressNew = cfg.newPerDay > 0 ? newDone / cfg.newPerDay : 1;
+    const progressReview = cfg.reviewsPerDay > 0 ? reviewDone / cfg.reviewsPerDay : 1;
+    const preferNew = canNew && (!canReview || progressNew < progressReview);
+
+    const first = preferNew ? await tryPickNew() : await tryPickReview();
+    if (first) return first;
+
+    const second = preferNew ? await tryPickReview() : await tryPickNew();
+    if (second) return second;
   }
 
   // d) learn-ahead: if enabled and nothing else is available, treat soon learn/relearn as available.
