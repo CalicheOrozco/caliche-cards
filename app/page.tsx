@@ -566,13 +566,22 @@ function extractMultipleChoiceAnswerFromCard(card: {
     ? (card.fieldNames as unknown[]).map((x) => String(x ?? ""))
     : undefined;
 
+  // If the deck defines pinned back fields (Definitions 1/2, etc) and the note
+  // has them populated, prefer the FIRST pinned field as the MC source.
+  const pinned = pickFieldSectionsByLabel({
+    fieldsHtml,
+    fieldNames,
+    labelNormalizedInOrder: PINNED_BACK_FIELD_LABELS_NORMALIZED,
+  });
+  const pinnedFirstHtml = pinned[0]?.valueHtml ?? null;
+
   const sections = inferFieldSectionsForHtml({
     html: card.backHtml,
     fieldsHtml,
     fieldNames,
   });
 
-  const firstHtml = sections[0]?.valueHtml ?? card.backHtml;
+  const firstHtml = pinnedFirstHtml ?? sections[0]?.valueHtml ?? card.backHtml;
   return extractMultipleChoiceAnswerFromBackHtml(firstHtml);
 }
 
