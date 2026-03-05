@@ -1174,6 +1174,12 @@ export default function Home() {
   // Reverse: autoplay once when user reveals (showAnswer becomes true).
   const lastReverseRevealAutoPlayedCardIdRef = useRef<number | null>(null);
 
+  // The per-card style is chosen in an effect; keep the chosen value in a ref so
+  // other effects (like autoplay) can avoid running with stale style state.
+  const chosenAnswerStyleForCardIdRef = useRef<
+    { cardId: number; style: ReviewAnswerStyle } | null
+  >(null);
+
   // Auto-load demo decks once when in Guest/Test mode.
   const attemptedGuestAutoLoadRef = useRef(false);
 
@@ -3781,6 +3787,8 @@ export default function Home() {
 
     const idx = Math.min(available.length - 1, Math.floor(rand01() * available.length));
     const chosen = available[idx] ?? "normal";
+
+    chosenAnswerStyleForCardIdRef.current = { cardId: currentId, style: chosen };
     setReviewAnswerStyle(chosen);
 
     // Always start a new card unflipped.
@@ -3918,7 +3926,13 @@ export default function Home() {
   useEffect(() => {
     if (mode !== "review") return;
     if (currentId == null) return;
-    if (reviewAnswerStyle === "reverse") return;
+    const chosen = chosenAnswerStyleForCardIdRef.current;
+    const effectiveStyle =
+      chosen?.cardId === currentId ? chosen.style : reviewAnswerStyle;
+
+    // Wait until state has caught up with the chosen style.
+    if (effectiveStyle !== reviewAnswerStyle) return;
+    if (effectiveStyle === "reverse") return;
     if (showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
@@ -3938,7 +3952,13 @@ export default function Home() {
   useEffect(() => {
     if (mode !== "review") return;
     if (currentId == null) return;
-    if (reviewAnswerStyle !== "reverse") return;
+    const chosen = chosenAnswerStyleForCardIdRef.current;
+    const effectiveStyle =
+      chosen?.cardId === currentId ? chosen.style : reviewAnswerStyle;
+
+    // Wait until state has caught up with the chosen style.
+    if (effectiveStyle !== reviewAnswerStyle) return;
+    if (effectiveStyle !== "reverse") return;
     if (!showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
@@ -3959,6 +3979,7 @@ export default function Home() {
     if (mode !== "review") {
       lastAutoPlayedCardIdRef.current = null;
       lastReverseRevealAutoPlayedCardIdRef.current = null;
+      chosenAnswerStyleForCardIdRef.current = null;
     }
   }, [mode]);
 
