@@ -291,10 +291,12 @@ function SoundButton({
   namespace,
   filename,
   variant = "pill",
+  disabled = false,
 }: {
   namespace: string;
   filename: string;
   variant?: "pill" | "icon";
+  disabled?: boolean;
 }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -321,7 +323,7 @@ function SoundButton({
         <button
           type="button"
           onClick={handlePlay}
-          disabled={isLoading}
+          disabled={isLoading || disabled}
           title={filename}
           aria-label="Play"
           className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-foreground/15 hover:bg-foreground/5 disabled:opacity-50"
@@ -338,7 +340,7 @@ function SoundButton({
       <button
         type="button"
         onClick={handlePlay}
-        disabled={isLoading}
+        disabled={isLoading || disabled}
         title={filename}
         className="inline-flex items-center gap-2 rounded-full border border-foreground/15 px-3 py-2 text-sm hover:bg-foreground/5 disabled:opacity-50"
       >
@@ -999,11 +1001,13 @@ function CardFace({
   html,
   className,
   suppressFirstSoundFilename,
+  soundDisabled,
 }: {
   namespace: string;
   html: string;
   className?: string;
   suppressFirstSoundFilename?: string | null;
+  soundDisabled?: boolean;
 }) {
   const parts = useMemo(() => {
     const base = splitBySoundTag(String(html ?? "")).map((p) => {
@@ -1037,7 +1041,11 @@ function CardFace({
         if (p.type === "sound") {
           return (
             <div key={`sound-${idx}-${p.filename}`} className="my-2">
-              <SoundButton namespace={namespace} filename={p.filename} />
+              <SoundButton
+                namespace={namespace}
+                filename={p.filename}
+                disabled={Boolean(soundDisabled)}
+              />
             </div>
           );
         }
@@ -1162,6 +1170,9 @@ export default function Home() {
 
   // Prevent double autoplay from re-renders; reset when card changes.
   const lastAutoPlayedCardIdRef = useRef<number | null>(null);
+
+  // Reverse: autoplay once when user reveals (showAnswer becomes true).
+  const lastReverseRevealAutoPlayedCardIdRef = useRef<number | null>(null);
 
   // Auto-load demo decks once when in Guest/Test mode.
   const attemptedGuestAutoLoadRef = useRef(false);
@@ -3822,6 +3833,8 @@ export default function Home() {
     return null;
   }, [current]);
 
+  const isReverseAudioLocked = mode === "review" && reviewAnswerStyle === "reverse" && !showAnswer;
+
   const currentTimingTag = useMemo(() => {
     if (!current) return null;
 
@@ -3905,6 +3918,7 @@ export default function Home() {
   useEffect(() => {
     if (mode !== "review") return;
     if (currentId == null) return;
+    if (reviewAnswerStyle === "reverse") return;
     if (showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
@@ -3919,11 +3933,32 @@ export default function Home() {
         // ignore
       }
     })();
-  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace]);
+  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle]);
+
+  useEffect(() => {
+    if (mode !== "review") return;
+    if (currentId == null) return;
+    if (reviewAnswerStyle !== "reverse") return;
+    if (!showAnswer) return;
+    const filename = promotedSound?.filename;
+    if (!filename) return;
+    if (lastReverseRevealAutoPlayedCardIdRef.current === currentId) return;
+    lastReverseRevealAutoPlayedCardIdRef.current = currentId;
+
+    // Autoplay can be blocked by the browser; ignore failures.
+    void (async () => {
+      try {
+        await tryPlayAudioFilename(activeNamespace, filename);
+      } catch {
+        // ignore
+      }
+    })();
+  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle]);
 
   useEffect(() => {
     if (mode !== "review") {
       lastAutoPlayedCardIdRef.current = null;
+      lastReverseRevealAutoPlayedCardIdRef.current = null;
     }
   }, [mode]);
 
@@ -4554,6 +4589,7 @@ export default function Home() {
                         namespace={activeNamespace}
                         filename={promotedSound.filename}
                         variant="icon"
+                        disabled={isReverseAudioLocked}
                       />
                     </div>
                   ) : null}
@@ -4675,6 +4711,7 @@ export default function Home() {
                               ? promotedSound.filename
                               : null
                           }
+                          soundDisabled={isReverseAudioLocked}
                           className="text-center text-xl leading-8"
                         />
                       </div>
