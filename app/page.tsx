@@ -1163,25 +1163,14 @@ export default function Home() {
   // Prevent double autoplay from re-renders; reset when card changes.
   const lastAutoPlayedCardIdRef = useRef<number | null>(null);
 
-  // Auto-sync when finishing a review session (best-effort, silent).
-  const lastAutoSyncKeyRef = useRef<string | null>(null);
-  const pendingAutoSyncKeyRef = useRef<string | null>(null);
-  const prevHadReviewCardRef = useRef(false);
-
   // Auto-load demo decks once when in Guest/Test mode.
   const attemptedGuestAutoLoadRef = useRef(false);
-
-  // Auto-sync once after login.
-  const attemptedPostLoginSyncRef = useRef(false);
 
   // Prevent slow/stale async updates when rapidly advancing cards.
   const loadNextSeqRef = useRef(0);
   const lastOverviewRefreshAtRef = useRef(0);
 
   // Randomize per-card answer style (50/50) when a new card is shown.
-
-  const onSyncFromCloudRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(onSyncFromCloud);
-  onSyncFromCloudRef.current = onSyncFromCloud;
 
   const onLoadDemoDecksRef = useRef<() => Promise<void>>(onLoadDemoDecks);
   onLoadDemoDecksRef.current = onLoadDemoDecks;
@@ -1267,22 +1256,6 @@ export default function Home() {
     }
     return libraries;
   }, [authUser, libraries]);
-
-  useEffect(() => {
-    if (!authUser) {
-      attemptedPostLoginSyncRef.current = false;
-      return;
-    }
-    if (attemptedPostLoginSyncRef.current) return;
-    if (busy || syncBusy) return;
-
-    // Wait for any guest/demo decks to be cleaned up before syncing.
-    const hasGuest = libraries.some((l) => (l as { source?: unknown }).source === "guest");
-    if (hasGuest) return;
-
-    attemptedPostLoginSyncRef.current = true;
-    void onSyncFromCloudRef.current({ silent: true });
-  }, [authUser, libraries, busy, syncBusy]);
 
   useEffect(() => {
     if (!isGuestMode) {
@@ -1664,51 +1637,6 @@ export default function Home() {
     });
   }
 
-  const pushDeckConfigToCloudNow = useCallback(
-    async (ref: DeckRef): Promise<void> => {
-      // Best-effort: if user isn't logged in, just skip.
-      const db = getStudyDb();
-      const row = await db.decks.get([ref.libraryId, ref.deckId]);
-      if (!row) return;
-
-      const res = await fetchWithTimeout(
-        "/api/sync/progress/push",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            libraryId: ref.libraryId,
-            deckConfigs: [
-              {
-                libraryId: ref.libraryId,
-                deckId: ref.deckId,
-                newPerDay: row.newPerDay,
-                reviewsPerDay: row.reviewsPerDay,
-                cardInfoOpenByDefault: Boolean((row as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
-                updatedAt: row.updatedAt,
-              },
-            ],
-          }),
-        },
-        30_000,
-        "Cloud update"
-      );
-
-      if (res.status === 401) return;
-      if (!res.ok) {
-        const errData: unknown = await res.json().catch(() => null);
-        const msg = (() => {
-          if (!errData || typeof errData !== "object") return null;
-          if (!("error" in errData)) return null;
-          const err = (errData as { error?: unknown }).error;
-          return typeof err === "string" ? err : null;
-        })();
-        throw new Error(msg ?? "Cloud update failed");
-      }
-    },
-    [fetchWithTimeout]
-  );
-
   async function uploadLibraryDeckDataToCloudNow(args: {
     libraryId: string;
     libraryName: string;
@@ -1876,12 +1804,6 @@ export default function Home() {
     const ok = confirm("Are you sure you want to log out?");
     if (!ok) return;
     try {
-      try {
-        await onSyncFromCloudRef.current({ silent: true });
-      } catch {
-        // ignore
-      }
-
       try {
         await onClearSaved();
       } catch {
@@ -2081,7 +2003,7 @@ export default function Home() {
       const baseName = file.name.replace(/\.[^.]+$/u, "").trim();
       const name = baseName || "Deck";
 
-      const { item: nextItem, imported } = await importApkgAsLibrary({
+      const { item: nextItem } = await importApkgAsLibrary({
         libraryId: id,
         libraryName: name,
         file,
@@ -2098,38 +2020,6 @@ export default function Home() {
       });
 
       setActiveLibraryId(id);
-
-      // Best-effort: persist this deck to the user's cloud DB.
-      void (async () => {
-        if (!authUser) return;
-        try {
-          await uploadDeckDataToCloud({ libraryId: id, name, deck: imported });
-
-          // Best-effort: upload referenced media blobs so other devices can
-          // fetch them on-demand (without uploading the full .apkg).
-          try {
-            await uploadLibraryMediaToCloudNow({ libraryId: id, deck: imported });
-          } catch {
-            // ignore
-          }
-
-          const ts = Date.now();
-          setLastSyncAt(ts);
-          setLastPushAtLocal(ts);
-          const { state } = await loadLastState();
-          if (state) {
-            await saveLastState({
-              libraries: state.libraries,
-              activeLibraryId: state.activeLibraryId,
-              savedAt: Date.now(),
-              lastSyncAt: ts,
-              lastPushAtLocal: ts,
-            });
-          }
-        } catch {
-          // ignore (offline or server error)
-        }
-      })();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Error importing .apkg";
       setError(msg);
@@ -3030,13 +2920,6 @@ export default function Home() {
       const next = Number(raw);
       await setDeckNewPerDay({ libraryId, deckId }, next);
 
-      // Push deck config to cloud immediately (no Sync button).
-      try {
-        await pushDeckConfigToCloudNow({ libraryId, deckId });
-      } catch {
-        setError("Updated locally, but failed to update cloud settings.");
-      }
-
       // Optimistically reflect in UI even if overview refresh lags.
       setDeckOverviews((prev) => {
         const key = `${libraryId}:${deckId}`;
@@ -3063,19 +2946,12 @@ export default function Home() {
         setReviewDeckConfig(cfg);
       }
     },
-    [reviewRef, pushDeckConfigToCloudNow]
+    [reviewRef]
   );
 
   const commitCardInfoDefaultOpen = useCallback(
     async (libraryId: string, deckId: number, next: boolean) => {
       await setDeckCardInfoOpenByDefault({ libraryId, deckId }, next);
-
-      // Push deck config to cloud immediately (no Sync button).
-      try {
-        await pushDeckConfigToCloudNow({ libraryId, deckId });
-      } catch {
-        setError("Updated locally, but failed to update cloud settings.");
-      }
 
       // Optimistically reflect in UI even if overview refresh lags.
       setDeckOverviews((prev) => {
@@ -3103,7 +2979,7 @@ export default function Home() {
         setReviewDeckConfig(cfg);
       }
     },
-    [reviewRef, pushDeckConfigToCloudNow]
+    [reviewRef]
   );
 
   const commitDeckAnswerStyles = useCallback(
@@ -3239,7 +3115,7 @@ export default function Home() {
       },
     }));
 
-    // Persist rename in StudyDB and upload updated deckdata to cloud.
+    // Persist rename in StudyDB.
     void (async () => {
       try {
         const now = Date.now();
@@ -3262,10 +3138,8 @@ export default function Home() {
           });
         }
 
-        const libName = libraries.find((l) => l.id === libraryId)?.name ?? "Deck";
-        await uploadLibraryDeckDataToCloudNow({ libraryId, libraryName: libName });
       } catch {
-        setError("Renamed locally, but failed to update cloud deck data.");
+        setError("Renamed locally, but failed to save the rename.");
       }
     })();
   }
@@ -3417,34 +3291,6 @@ export default function Home() {
       try {
         await resetDeckProgress({ libraryId, deckId });
 
-        // Best-effort: reset in cloud so it doesn't reappear on other devices.
-        try {
-          const res = await fetchWithTimeout(
-            "/api/sync/progress/reset",
-            {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ libraryId, deckId }),
-            },
-            30_000,
-            "Cloud reset"
-          );
-          if (!res.ok) {
-            const errData: unknown = await res.json().catch(() => null);
-            const msg = (() => {
-              if (!errData || typeof errData !== "object") return null;
-              if (!("error" in errData)) return null;
-              const err = (errData as { error?: unknown }).error;
-              return typeof err === "string" ? err : null;
-            })();
-            throw new Error(msg ?? "Cloud reset failed");
-          }
-        } catch {
-          setError(
-            "Progress was reset locally, but cloud reset failed. Sync on another device may still show old progress."
-          );
-        }
-
         const ov = await getDeckOverview({ libraryId, deckId });
         setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
 
@@ -3463,7 +3309,7 @@ export default function Home() {
         setBusy(false);
       }
     },
-    [reviewRef, fetchWithTimeout]
+    [reviewRef]
   );
 
   async function loadNext(ref: DeckRef, excludeCardId?: number) {
@@ -3935,6 +3781,9 @@ export default function Home() {
     writeExpectedChars.length,
     mcCorrectAnswer,
     mcDecoysForCard.length,
+    reversePromptHtml,
+    reverseCorrectFront,
+    reverseDecoysForCard.length,
   ]);
 
   useEffect(() => {
@@ -4077,43 +3926,6 @@ export default function Home() {
       lastAutoPlayedCardIdRef.current = null;
     }
   }, [mode]);
-
-  useEffect(() => {
-    if (isGuestMode) {
-      prevHadReviewCardRef.current = false;
-      pendingAutoSyncKeyRef.current = null;
-      return;
-    }
-    if (mode !== "review") {
-      prevHadReviewCardRef.current = false;
-      pendingAutoSyncKeyRef.current = null;
-      return;
-    }
-
-    const hasCurrent = Boolean(current);
-    const transitionedToDone = !hasCurrent && prevHadReviewCardRef.current;
-    prevHadReviewCardRef.current = hasCurrent;
-
-    if (transitionedToDone && reviewRef) {
-      const bucket = Math.floor(Date.now() / (10 * 60 * 1000));
-      const key = `${reviewRef.libraryId}:${reviewRef.deckId}:${bucket}`;
-      if (lastAutoSyncKeyRef.current !== key) {
-        pendingAutoSyncKeyRef.current = key;
-      }
-    }
-
-    const pendingKey = pendingAutoSyncKeyRef.current;
-    if (!pendingKey) return;
-    if (lastAutoSyncKeyRef.current === pendingKey) {
-      pendingAutoSyncKeyRef.current = null;
-      return;
-    }
-    if (syncBusy || busy || reviewBusy) return;
-
-    lastAutoSyncKeyRef.current = pendingKey;
-    pendingAutoSyncKeyRef.current = null;
-    void onSyncFromCloudRef.current({ silent: true });
-  }, [isGuestMode, mode, current, reviewRef, syncBusy, busy, reviewBusy]);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
