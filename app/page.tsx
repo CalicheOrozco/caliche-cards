@@ -4611,6 +4611,17 @@ export default function Home() {
                         <div className="text-center text-sm text-foreground/70">
                           Click (or Tab to) the letters to write the word
                         </div>
+                        {writeOutcome != null ? (
+                          <div
+                            className={`mt-2 text-center text-sm font-medium ${
+                              writeOutcome === "correct"
+                                ? "text-green-500"
+                                : "text-red-400"
+                            }`}
+                          >
+                            {writeOutcome === "correct" ? "Correct" : "Wrong"}
+                          </div>
+                        ) : null}
                         {!writeIsAvailable ? (
                           <div className="mt-3 text-center text-sm text-foreground/70">
                             Write mode isn’t available for this card.
@@ -4625,9 +4636,10 @@ export default function Home() {
                                       <button
                                         key={`picked-${currentId ?? ""}-${pickedIdx}-${p.index}-${p.ch}`}
                                         type="button"
-                                        disabled={reviewBusy}
+                                        disabled={reviewBusy || writeOutcome != null}
                                         onClick={() => {
                                           if (reviewBusy) return;
+                                          if (writeOutcome != null) return;
                                           setWritePicked((prev) =>
                                             prev.filter((_, i) => i !== pickedIdx)
                                           );
@@ -4653,11 +4665,13 @@ export default function Home() {
                                 disabled={
                                   reviewBusy ||
                                   !writeIsAvailable ||
-                                  writePicked.length === 0
+                                  writePicked.length === 0 ||
+                                  writeOutcome != null
                                 }
                                 onClick={() => {
                                   if (!writeIsAvailable) return;
                                   if (writePicked.length === 0) return;
+                                  if (writeOutcome != null) return;
 
                                   const expected = writeExpectedChars.join("");
                                   const answer = writePicked.map((p) => p.ch).join("");
@@ -4666,7 +4680,6 @@ export default function Home() {
                                     expected.normalize("NFKC").toLowerCase();
 
                                   setWriteOutcome(ok ? "correct" : "wrong");
-                                  setShowAnswer(true);
                                 }}
                               >
                                 Submit
@@ -4680,10 +4693,11 @@ export default function Home() {
                                   <button
                                     key={`write-${currentId ?? ""}-${idx}-${ch}`}
                                     type="button"
-                                    disabled={reviewBusy || used}
+                                    disabled={reviewBusy || used || writeOutcome != null}
                                     onClick={() => {
                                       if (reviewBusy) return;
                                       if (used) return;
+                                      if (writeOutcome != null) return;
                                       setWritePicked((prev) => [...prev, { index: idx, ch }]);
                                     }}
                                     className={`h-12 w-12 rounded-2xl border border-foreground/15 text-lg font-semibold hover:bg-foreground/5 disabled:opacity-40 ${
@@ -4718,6 +4732,17 @@ export default function Home() {
                         <div className="text-center text-sm text-foreground/70">
                           Choose the correct answer
                         </div>
+                        {mcOutcome != null ? (
+                          <div
+                            className={`mt-2 text-center text-sm font-medium ${
+                              mcOutcome === "correct"
+                                ? "text-green-500"
+                                : "text-red-400"
+                            }`}
+                          >
+                            {mcOutcome === "correct" ? "Correct" : "Wrong"}
+                          </div>
+                        ) : null}
                         {!mcCanRun ? (
                           <div className="mt-3 text-center text-sm text-foreground/70">
                             Multiple-choice isn’t available for this card.
@@ -4735,7 +4760,6 @@ export default function Home() {
 
                                   const ok = Boolean(opt.isCorrect);
                                   setMcOutcome(ok ? "correct" : "wrong");
-                                  setShowAnswer(true);
                                 }}
                                 className="min-h-12 rounded-2xl border border-foreground/15 bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-60"
                               >
@@ -4862,14 +4886,21 @@ export default function Home() {
                   !showAnswer ? (
                     reviewAnswerStyle === "normal" ||
                     (reviewAnswerStyle === "write" && !writeIsAvailable) ||
-                    (reviewAnswerStyle === "multiple-choice" && !mcCanRun) ? (
+                    (reviewAnswerStyle === "multiple-choice" && !mcCanRun) ||
+                    (reviewAnswerStyle === "write" && writeOutcome != null) ||
+                    (reviewAnswerStyle === "multiple-choice" && mcOutcome != null) ? (
                       <button
                         type="button"
                         className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
                         onClick={() => setShowAnswer(true)}
                         disabled={reviewBusy}
                       >
-                        Show answer
+                        {reviewAnswerStyle === "write" && writeOutcome != null
+                          ? "Reveal answer"
+                          : reviewAnswerStyle === "multiple-choice" &&
+                              mcOutcome != null
+                            ? "Reveal answer"
+                            : "Show answer"}
                       </button>
                     ) : null
                   ) : (
@@ -4880,7 +4911,6 @@ export default function Home() {
                         onClick={() => void onAnswer("fail")}
                         disabled={
                           reviewBusy ||
-                          (reviewAnswerStyle === "write" && writeOutcome === "correct") ||
                           (reviewAnswerStyle === "multiple-choice" && mcOutcome === "correct")
                         }
                       >
