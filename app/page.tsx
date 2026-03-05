@@ -459,6 +459,25 @@ function htmlToText(inputHtml: string): string {
   }
 }
 
+function htmlToTextWithBreaks(inputHtml: string): string {
+  const input = String(inputHtml ?? "");
+  if (!input) return "";
+
+  try {
+    const doc = new DOMParser().parseFromString(input, "text/html");
+    // `innerText` preserves <br> and block element line breaks in browsers.
+    const raw = String((doc.body as unknown as { innerText?: unknown })?.innerText ?? "");
+    return raw.replace(/\r\n?/gu, "\n").replace(/[\t\f\v]+/gu, " ").trim();
+  } catch {
+    // Fallback: approximate breaks by replacing <br> tags.
+    return input
+      .replace(/<br\s*\/?\s*>/giu, "\n")
+      .replace(/<[^>]*>/gu, " ")
+      .replace(/\s+\n\s+/gu, "\n")
+      .trim();
+  }
+}
+
 function normalizeLabel(s: string) {
   return String(s ?? "")
     .trim()
@@ -492,6 +511,57 @@ function extractWriteWordFromText(text: string): string | null {
   const picked = String(match?.[0] ?? "");
   const chars = toWriteChars(picked);
   return chars.length > 0 ? chars.join("") : null;
+}
+
+function normalizeChoiceText(input: string): string {
+  return String(input ?? "")
+    .normalize("NFKC")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function extractMultipleChoiceAnswerFromBackHtml(backHtml: string): string | null {
+  const t = htmlToTextWithBreaks(backHtml);
+  if (!t) return null;
+
+  // "First element" heuristic: first non-empty line, then before common separators.
+  const firstLine =
+    t
+      .split("\n")
+      .map((s) => s.trim())
+      .find(Boolean) ?? "";
+  if (!firstLine) return null;
+
+  const beforeSep = firstLine
+    .split(/\s*(?:•|\||;|,|\/|·)\s*/u)[0]
+    ?.trim();
+
+  const picked = String(beforeSep ?? firstLine).replace(/\s+/gu, " ").trim();
+  return picked ? picked : null;
+}
+
+function extractMultipleChoiceAnswerFromCard(card: {
+  frontHtml: string;
+  backHtml: string;
+  fieldsHtml?: unknown;
+  fieldNames?: unknown;
+}): string | null {
+  const fieldsHtml = Array.isArray(card.fieldsHtml)
+    ? (card.fieldsHtml as unknown[]).map((x) => String(x ?? ""))
+    : undefined;
+  const fieldNames = Array.isArray(card.fieldNames)
+    ? (card.fieldNames as unknown[]).map((x) => String(x ?? ""))
+    : undefined;
+
+  const sections = inferFieldSectionsForHtml({
+    html: card.backHtml,
+    fieldsHtml,
+    fieldNames,
+  });
+
+  const firstHtml = sections[0]?.valueHtml ?? card.backHtml;
+  return extractMultipleChoiceAnswerFromBackHtml(firstHtml);
 }
 
 function pickWriteTargetFromCard(card: {
@@ -971,10 +1041,12 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [showAnswer, setShowAnswer] = useState(false);
-  type ReviewAnswerStyle = "normal" | "write";
+  type ReviewAnswerStyle = "normal" | "write" | "multiple-choice";
   const [reviewAnswerStyle, setReviewAnswerStyle] = useState<ReviewAnswerStyle>("normal");
   const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
   const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
+  const [mcOutcome, setMcOutcome] = useState<"correct" | "wrong" | null>(null);
+  const [mcAnswerPool, setMcAnswerPool] = useState<string[]>([]);
   const [reviewRef, setReviewRef] = useState<DeckRef | null>(null);
   const [current, setCurrent] = useState<NextCard | null>(null);
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -3262,6 +3334,13 @@ export default function Home() {
       const cfg = await getDeckConfig(ref);
       setReviewDeckConfig(cfg);
 
+      try {
+        const pool = await preloadMcAnswerPool(ref);
+        setMcAnswerPool(pool);
+      } catch {
+        setMcAnswerPool([]);
+      }
+
       setReviewRef(ref);
       setMode("review");
 
@@ -3351,6 +3430,53 @@ export default function Home() {
     return toWriteChars(writeExpected);
   }, [writeExpected]);
 
+  const mcCorrectAnswer = useMemo(() => {
+    if (!current) return null;
+    return extractMultipleChoiceAnswerFromCard({
+      frontHtml: current.card.frontHtml,
+      backHtml: current.card.backHtml,
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+    });
+  }, [current]);
+
+  const mcDecoysForCard = useMemo(() => {
+    if (!mcCorrectAnswer) return [];
+    const correctKey = normalizeChoiceText(mcCorrectAnswer);
+    return mcAnswerPool.filter((x) => normalizeChoiceText(x) !== correctKey);
+  }, [mcAnswerPool, mcCorrectAnswer]);
+
+  const mcOptions = useMemo(() => {
+    if (!currentId) return [];
+    if (!mcCorrectAnswer) return [];
+
+    const seed = `${currentId}:${normalizeChoiceText(mcCorrectAnswer)}`;
+    const shuffledDecoys = seededShuffle(mcDecoysForCard, `${seed}:decoys`);
+    const pickedDecoys = shuffledDecoys.slice(0, 3);
+
+    const correctKey = normalizeChoiceText(mcCorrectAnswer);
+    const uniq: Array<{ label: string; key: string }> = [];
+    const seen = new Set<string>();
+    const add = (label: string) => {
+      const key = normalizeChoiceText(label);
+      if (!key) return;
+      if (seen.has(key)) return;
+      seen.add(key);
+      uniq.push({ label, key });
+    };
+
+    add(mcCorrectAnswer);
+    for (const d of pickedDecoys) add(d);
+
+    if (uniq.length < 2) return [];
+
+    const shuffled = seededShuffle(uniq, `${seed}:options`);
+    return shuffled.map((o) => ({
+      label: o.label,
+      isCorrect: o.key === correctKey,
+    }));
+  }, [currentId, mcCorrectAnswer, mcDecoysForCard]);
+
   const writeBank = useMemo(() => {
     if (writeExpectedChars.length === 0) return [];
     const seed = `${currentId ?? ""}:${writeExpectedChars.join("")}`;
@@ -3400,6 +3526,35 @@ export default function Home() {
   }, [writePicked]);
 
   const writeIsAvailable = reviewAnswerStyle === "write" && writeExpectedChars.length > 0;
+  const mcCanRun = Boolean(mcCorrectAnswer) && mcDecoysForCard.length > 0;
+
+  async function preloadMcAnswerPool(ref: DeckRef): Promise<string[]> {
+    const db = getStudyDb();
+    const cards = await db.cards
+      .where("[libraryId+deckId]")
+      .equals([ref.libraryId, ref.deckId])
+      .limit(400)
+      .toArray();
+
+    const answers: string[] = [];
+    const seen = new Set<string>();
+    for (const c of cards) {
+      const a = extractMultipleChoiceAnswerFromCard({
+        frontHtml: c.frontHtml,
+        backHtml: c.backHtml,
+        fieldsHtml: c.fieldsHtml,
+        fieldNames: c.fieldNames,
+      });
+      if (!a) continue;
+      const key = normalizeChoiceText(a);
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      answers.push(a);
+      if (answers.length >= 160) break;
+    }
+    return answers;
+  }
 
   useEffect(() => {
     if (mode !== "review") return;
@@ -3415,20 +3570,26 @@ export default function Home() {
       }
     };
 
-    const chosen: ReviewAnswerStyle = rand01() < 0.5 ? "normal" : "write";
-
-    // If write isn't possible for this card, force normal.
     const canWrite = writeExpectedChars.length > 0;
-    setReviewAnswerStyle(chosen === "write" && !canWrite ? "normal" : chosen);
+    const canMc = Boolean(mcCorrectAnswer) && mcDecoysForCard.length > 0;
+
+    const available: ReviewAnswerStyle[] = ["normal"];
+    if (canWrite) available.push("write");
+    if (canMc) available.push("multiple-choice");
+
+    const idx = Math.min(available.length - 1, Math.floor(rand01() * available.length));
+    const chosen = available[idx] ?? "normal";
+    setReviewAnswerStyle(chosen);
 
     // Always start a new card unflipped.
     setShowAnswer(false);
-  }, [mode, currentId, writeExpectedChars.length]);
+  }, [mode, currentId, writeExpectedChars.length, mcCorrectAnswer, mcDecoysForCard.length]);
 
   useEffect(() => {
     // Reset write state when the card changes or the user changes style.
     setWritePicked([]);
     setWriteOutcome(null);
+    setMcOutcome(null);
   }, [currentId, reviewAnswerStyle]);
 
   useEffect(() => {
@@ -4251,6 +4412,43 @@ export default function Home() {
                       </div>
                     )}
 
+                    {reviewAnswerStyle === "multiple-choice" && !showAnswer ? (
+                      <div className="pb-2">
+                        <div className="text-center text-sm text-foreground/70">
+                          Choose the correct answer
+                        </div>
+                        {!mcCanRun ? (
+                          <div className="mt-3 text-center text-sm text-foreground/70">
+                            Multiple-choice isn’t available for this card.
+                          </div>
+                        ) : (
+                          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                            {mcOptions.map((opt, idx) => (
+                              <button
+                                key={`mc-${currentId ?? ""}-${idx}-${opt.label}`}
+                                type="button"
+                                disabled={reviewBusy || mcOutcome != null}
+                                onClick={() => {
+                                  if (reviewBusy) return;
+                                  if (mcOutcome != null) return;
+
+                                  const ok = Boolean(opt.isCorrect);
+                                  setMcOutcome(ok ? "correct" : "wrong");
+                                  setShowAnswer(true);
+                                }}
+                                className="min-h-12 rounded-2xl border border-foreground/15 bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-60"
+                              >
+                                <span className="mr-2 text-foreground/60">
+                                  {String.fromCharCode(65 + (idx % 26))}.
+                                </span>
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
+
                     {showAnswer ? (
                       <div className="border-t border-foreground/15 pt-6">
                         {answerFieldSections.length > 0 ? (
@@ -4338,7 +4536,9 @@ export default function Home() {
               <div className="flex flex-col gap-3 sm:flex-row">
                 {current ? (
                   !showAnswer ? (
-                    reviewAnswerStyle === "normal" || !writeIsAvailable ? (
+                    reviewAnswerStyle === "normal" ||
+                    (reviewAnswerStyle === "write" && !writeIsAvailable) ||
+                    (reviewAnswerStyle === "multiple-choice" && !mcCanRun) ? (
                       <button
                         type="button"
                         className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
@@ -4356,7 +4556,8 @@ export default function Home() {
                         onClick={() => void onAnswer("fail")}
                         disabled={
                           reviewBusy ||
-                          (reviewAnswerStyle === "write" && writeOutcome === "correct")
+                          (reviewAnswerStyle === "write" && writeOutcome === "correct") ||
+                          (reviewAnswerStyle === "multiple-choice" && mcOutcome === "correct")
                         }
                       >
                         Fail{nextDueLabels ? ` • ${nextDueLabels.fail}` : ""}
@@ -4367,7 +4568,8 @@ export default function Home() {
                         onClick={() => void onAnswer("pass")}
                         disabled={
                           reviewBusy ||
-                          (reviewAnswerStyle === "write" && writeOutcome === "wrong")
+                          (reviewAnswerStyle === "write" && writeOutcome === "wrong") ||
+                          (reviewAnswerStyle === "multiple-choice" && mcOutcome === "wrong")
                         }
                       >
                         Pass{nextDueLabels ? ` • ${nextDueLabels.pass}` : ""}
