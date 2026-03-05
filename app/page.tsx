@@ -14,13 +14,21 @@ import {
 } from "../lib/deckStorage";
 import { clearMedia, getMediaBlob, saveMediaItems } from "../lib/mediaStorage";
 import { clearApkg, getApkgFile, saveApkgFile } from "../lib/apkgStorage";
-import type { CardStateEntity, DeckConfig, DeckRef, NextCard, ReviewLogEntity } from "../lib/studyTypes";
+import type {
+  CardStateEntity,
+  DeckConfig,
+  DeckRef,
+  NextCard,
+  ReviewAnswerStyle,
+  ReviewLogEntity,
+} from "../lib/studyTypes";
 import {
   answerCard,
   getDeckConfig,
   getDeckOverview,
   getNextCard,
   resetDeckProgress,
+  setDeckAnswerStyles,
   setDeckCardInfoOpenByDefault,
   setDeckNewPerDay,
   startStudySession,
@@ -1041,12 +1049,12 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [showAnswer, setShowAnswer] = useState(false);
-  type ReviewAnswerStyle = "normal" | "write" | "multiple-choice";
   const [reviewAnswerStyle, setReviewAnswerStyle] = useState<ReviewAnswerStyle>("normal");
   const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
   const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
   const [mcOutcome, setMcOutcome] = useState<"correct" | "wrong" | null>(null);
   const [mcAnswerPool, setMcAnswerPool] = useState<string[]>([]);
+  const [mcAnswerPoolKey, setMcAnswerPoolKey] = useState<string | null>(null);
   const [reviewRef, setReviewRef] = useState<DeckRef | null>(null);
   const [current, setCurrent] = useState<NextCard | null>(null);
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -2645,6 +2653,10 @@ export default function Home() {
                 newPerDay: Math.max(0, Math.floor(Number(cfg.newPerDay) || 0)),
                 reviewsPerDay: Math.max(0, Math.floor(Number(cfg.reviewsPerDay) || 0)),
                 cardInfoOpenByDefault: Boolean((cfg as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
+                answerStyles:
+                  Array.isArray(local?.answerStyles) && local.answerStyles.length > 0
+                    ? local.answerStyles
+                    : DEFAULT_DECK_CONFIG.answerStyles,
                 createdAt: local?.createdAt ?? updatedAt,
                 updatedAt,
               });
@@ -2932,6 +2944,39 @@ export default function Home() {
     [reviewRef, pushDeckConfigToCloudNow]
   );
 
+  const commitDeckAnswerStyles = useCallback(
+    async (libraryId: string, deckId: number, next: ReviewAnswerStyle[]) => {
+      await setDeckAnswerStyles({ libraryId, deckId }, next);
+
+      // Optimistically reflect in UI even if overview refresh lags.
+      setDeckOverviews((prev) => {
+        const key = `${libraryId}:${deckId}`;
+        const existing = prev[key];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          [key]: {
+            ...existing,
+            config: {
+              ...existing.config,
+              answerStyles: next,
+            },
+          },
+        };
+      });
+
+      const ov = await getDeckOverview({ libraryId, deckId });
+      setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
+
+      if (reviewRef?.libraryId === libraryId && reviewRef.deckId === deckId) {
+        setReviewOverview(ov);
+        const cfg = await getDeckConfig({ libraryId, deckId });
+        setReviewDeckConfig(cfg);
+      }
+    },
+    [reviewRef]
+  );
+
   useEffect(() => {
     if (!openDeckMenu) return;
 
@@ -3049,6 +3094,7 @@ export default function Home() {
             newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
             reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
             cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
+            answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
             createdAt: now,
             updatedAt: now,
           });
@@ -3334,11 +3380,19 @@ export default function Home() {
       const cfg = await getDeckConfig(ref);
       setReviewDeckConfig(cfg);
 
-      try {
-        const pool = await preloadMcAnswerPool(ref);
-        setMcAnswerPool(pool);
-      } catch {
+      const mcEnabled = cfg.answerStyles.includes("multiple-choice");
+      if (mcEnabled) {
+        try {
+          const pool = await preloadMcAnswerPool(ref);
+          setMcAnswerPool(pool);
+          setMcAnswerPoolKey(`${ref.libraryId}:${ref.deckId}`);
+        } catch {
+          setMcAnswerPool([]);
+          setMcAnswerPoolKey(null);
+        }
+      } else {
         setMcAnswerPool([]);
+        setMcAnswerPoolKey(null);
       }
 
       setReviewRef(ref);
@@ -3442,9 +3496,11 @@ export default function Home() {
 
   const mcDecoysForCard = useMemo(() => {
     if (!mcCorrectAnswer) return [];
+    const wantsKey = reviewRef ? `${reviewRef.libraryId}:${reviewRef.deckId}` : null;
+    if (mcAnswerPoolKey !== wantsKey) return [];
     const correctKey = normalizeChoiceText(mcCorrectAnswer);
     return mcAnswerPool.filter((x) => normalizeChoiceText(x) !== correctKey);
-  }, [mcAnswerPool, mcCorrectAnswer]);
+  }, [mcAnswerPool, mcCorrectAnswer, mcAnswerPoolKey, reviewRef]);
 
   const mcOptions = useMemo(() => {
     if (!currentId) return [];
@@ -3570,12 +3626,23 @@ export default function Home() {
       }
     };
 
+    const enabledStyles: ReviewAnswerStyle[] =
+      reviewDeckConfig?.answerStyles?.length
+        ? reviewDeckConfig.answerStyles
+        : ["normal", "write", "multiple-choice"];
+
     const canWrite = writeExpectedChars.length > 0;
     const canMc = Boolean(mcCorrectAnswer) && mcDecoysForCard.length > 0;
 
-    const available: ReviewAnswerStyle[] = ["normal"];
-    if (canWrite) available.push("write");
-    if (canMc) available.push("multiple-choice");
+    const available: ReviewAnswerStyle[] = [];
+    for (const s of enabledStyles) {
+      if (s === "normal") available.push("normal");
+      else if (s === "write" && canWrite) available.push("write");
+      else if (s === "multiple-choice" && canMc) available.push("multiple-choice");
+    }
+
+    // Fallback: never block review just because a style can't run.
+    if (available.length === 0) available.push("normal");
 
     const idx = Math.min(available.length - 1, Math.floor(rand01() * available.length));
     const chosen = available[idx] ?? "normal";
@@ -3583,7 +3650,14 @@ export default function Home() {
 
     // Always start a new card unflipped.
     setShowAnswer(false);
-  }, [mode, currentId, writeExpectedChars.length, mcCorrectAnswer, mcDecoysForCard.length]);
+  }, [
+    mode,
+    currentId,
+    reviewDeckConfig?.answerStyles,
+    writeExpectedChars.length,
+    mcCorrectAnswer,
+    mcDecoysForCard.length,
+  ]);
 
   useEffect(() => {
     // Reset write state when the card changes or the user changes style.
@@ -4059,7 +4133,7 @@ export default function Home() {
                               </button>
 
                               {menuOpen ? (
-                                <div className="absolute right-0 top-12 z-10 w-40 rounded-xl border border-foreground/15 bg-background p-1 shadow-sm">
+                                <div className="absolute right-0 top-12 z-10 w-56 rounded-xl border border-foreground/15 bg-background p-1 shadow-sm">
                                   <button
                                     type="button"
                                     className="w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-foreground/5"
@@ -4154,6 +4228,49 @@ export default function Home() {
                                         }}
                                       />
                                     </label>
+                                  </div>
+
+                                  <div className="px-3 py-2">
+                                    <div className="text-xs text-foreground/70">Type of cards</div>
+                                    {(
+                                      [
+                                        { id: "normal" as const, label: "Normal" },
+                                        { id: "write" as const, label: "Write" },
+                                        { id: "multiple-choice" as const, label: "Multiple-choice" },
+                                      ] satisfies Array<{ id: ReviewAnswerStyle; label: string }>
+                                    ).map((opt) => {
+                                      const currentStyles = (overview?.config.answerStyles ?? [
+                                        "normal",
+                                        "write",
+                                        "multiple-choice",
+                                      ]) as ReviewAnswerStyle[];
+                                      const checked = currentStyles.includes(opt.id);
+
+                                      return (
+                                        <label
+                                          key={opt.id}
+                                          className="mt-2 flex items-center justify-between gap-3 text-xs text-foreground/70"
+                                        >
+                                          <span>{opt.label}</span>
+                                          <input
+                                            type="checkbox"
+                                            className="h-4 w-4"
+                                            checked={checked}
+                                            onChange={(e) => {
+                                              const wants = e.currentTarget.checked;
+                                              const next = (() => {
+                                                const base = new Set<ReviewAnswerStyle>(currentStyles);
+                                                if (wants) base.add(opt.id);
+                                                else base.delete(opt.id);
+                                                const arr = Array.from(base);
+                                                return arr.length > 0 ? arr : (["normal"] as ReviewAnswerStyle[]);
+                                              })();
+                                              void commitDeckAnswerStyles(lib.id, d.id, next);
+                                            }}
+                                          />
+                                        </label>
+                                      );
+                                    })}
                                   </div>
 
                                   <button
@@ -4271,7 +4388,7 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Answer style is randomized per card (normal vs write). */}
+              {/* Answer style is randomized per card (from enabled styles). */}
 
               {current ? (
                 <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-foreground/5 p-6">

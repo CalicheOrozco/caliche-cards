@@ -11,6 +11,7 @@ import type {
   DeckRef,
   NextCard,
   ReviewLogEntity,
+  ReviewAnswerStyle,
   StudyState,
 } from "./studyTypes";
 
@@ -45,8 +46,16 @@ export type DeckOverview = {
   newShown: number;
   reviewShown: number;
 
-  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay" | "cardInfoOpenByDefault">;
+  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay" | "cardInfoOpenByDefault" | "answerStyles">;
 };
+
+function sanitizeAnswerStyles(raw: unknown): ReviewAnswerStyle[] {
+  const allowed: ReviewAnswerStyle[] = ["normal", "write", "multiple-choice"];
+  if (!Array.isArray(raw)) return allowed;
+  const picked = raw.filter((x): x is ReviewAnswerStyle => allowed.includes(x as ReviewAnswerStyle));
+  const uniq = Array.from(new Set(picked));
+  return uniq.length > 0 ? uniq : allowed;
+}
 
 function isAvailable(state: CardStateEntity, now: number): boolean {
   if (state.suspended) return false;
@@ -64,6 +73,7 @@ export async function getDeckConfig(ref: DeckRef): Promise<DeckConfig> {
     newPerDay: deck.newPerDay,
     reviewsPerDay: deck.reviewsPerDay,
     cardInfoOpenByDefault: Boolean(deck.cardInfoOpenByDefault),
+    answerStyles: sanitizeAnswerStyles((deck as { answerStyles?: unknown }).answerStyles),
   };
 }
 
@@ -89,6 +99,7 @@ export async function setDeckCardInfoOpenByDefault(
       newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
       cardInfoOpenByDefault: next,
+      answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
       createdAt: now,
       updatedAt: now,
     });
@@ -114,8 +125,35 @@ export async function setDeckNewPerDay(ref: DeckRef, newPerDay: number): Promise
       newPerDay: next,
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
       cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
+      answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
       createdAt: now,
       updatedAt: now,
+    });
+  }
+}
+
+export async function setDeckAnswerStyles(ref: DeckRef, styles: ReviewAnswerStyle[]): Promise<void> {
+  const db = getStudyDb();
+  const next = sanitizeAnswerStyles(styles);
+  const now = Date.now();
+
+  // Local-only UI preference: intentionally do NOT bump updatedAt.
+  const updated = await db.decks.update([ref.libraryId, ref.deckId], {
+    answerStyles: next,
+  });
+
+  // If the deck row doesn't exist yet (race with initial seeding), create it.
+  if (updated === 0) {
+    await db.decks.put({
+      libraryId: ref.libraryId,
+      deckId: ref.deckId,
+      name: "",
+      newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
+      reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+      cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
+      answerStyles: next,
+      createdAt: now,
+      updatedAt: 0,
     });
   }
 }
@@ -139,6 +177,7 @@ export async function upsertImportedDeck(libraryId: string, imported: ImportedDe
         reviewsPerDay: prev?.reviewsPerDay ?? DEFAULT_DECK_CONFIG.reviewsPerDay,
         cardInfoOpenByDefault:
           prev?.cardInfoOpenByDefault ?? DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
+        answerStyles: sanitizeAnswerStyles((prev as { answerStyles?: unknown } | null)?.answerStyles),
         createdAt: prev?.createdAt ?? now,
         updatedAt: now,
       };
@@ -478,6 +517,7 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
       newPerDay: cfg.newPerDay,
       reviewsPerDay: cfg.reviewsPerDay,
       cardInfoOpenByDefault: cfg.cardInfoOpenByDefault,
+      answerStyles: cfg.answerStyles,
     },
   };
 }

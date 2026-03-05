@@ -1,5 +1,7 @@
 export type StudyState = "new" | "learn" | "review" | "relearn";
 
+export type ReviewAnswerStyle = "normal" | "write" | "multiple-choice";
+
 export type AnswerResult = "pass" | "fail";
 
 export type DeckRef = {
@@ -13,6 +15,9 @@ export type DeckConfig = {
 
   // UI preference: whether the "Card info" dropdown should be open by default.
   cardInfoOpenByDefault: boolean;
+
+  // UI preference: which answer styles may be shown during review.
+  answerStyles: ReviewAnswerStyle[];
 
   // Learning / relearning delays after a PASS while in learn/relearn.
   learnStepsMs: number[];
@@ -44,6 +49,9 @@ export type DeckEntity = {
 
   // UI preference (not used by scheduler).
   cardInfoOpenByDefault?: boolean;
+
+  // UI preference (not used by scheduler).
+  answerStyles?: ReviewAnswerStyle[];
 
   createdAt: number;
   updatedAt: number;
