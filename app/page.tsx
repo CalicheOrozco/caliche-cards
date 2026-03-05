@@ -469,6 +469,83 @@ function normalizeLabel(s: string) {
     .replace(/\s+/g, " ");
 }
 
+function toWriteChars(input: string): string[] {
+  const normalized = String(input ?? "")
+    .trim()
+    .normalize("NFKC")
+    .replace(/\s+/gu, " ");
+  if (!normalized) return [];
+
+  // Keep letters (including accents), spaces, and common word punctuation.
+  const chars = Array.from(normalized);
+  return chars.filter((ch) => /\p{L}/u.test(ch) || ch === " " || ch === "'" || ch === "-");
+}
+
+function extractWriteWordFromText(text: string): string | null {
+  const t = String(text ?? "").trim();
+  if (!t) return null;
+
+  // Find the first "phrase-like" token containing letters, allowing spaces between words.
+  // Example: "go on with"
+  const re = /[\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*)*/gu;
+  const match = re.exec(t);
+  const picked = String(match?.[0] ?? "");
+  const chars = toWriteChars(picked);
+  return chars.length > 0 ? chars.join("") : null;
+}
+
+function pickWriteTargetFromCard(card: {
+  frontHtml: string;
+  backHtml: string;
+  fieldsHtml?: unknown;
+  fieldNames?: unknown;
+}): string | null {
+  // Per product requirement: Write expects the word from the FRONT.
+  const fromFront = extractWriteWordFromText(htmlToText(card.frontHtml));
+  return fromFront;
+}
+
+function seededShuffle<T>(items: T[], seed: string): T[] {
+  const arr = items.slice();
+  if (arr.length <= 1) return arr;
+
+  // xmur3 + mulberry32 (tiny deterministic PRNG)
+  const xmur3 = (str: string) => {
+    let h = 1779033703 ^ str.length;
+    for (let i = 0; i < str.length; i += 1) {
+      h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+      h = (h << 13) | (h >>> 19);
+    }
+    return () => {
+      h = Math.imul(h ^ (h >>> 16), 2246822507);
+      h = Math.imul(h ^ (h >>> 13), 3266489909);
+      h ^= h >>> 16;
+      return h >>> 0;
+    };
+  };
+
+  const mulberry32 = (a: number) => {
+    return () => {
+      let t = (a += 0x6d2b79f5);
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  const seedFn = xmur3(seed);
+  const rand = mulberry32(seedFn());
+
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rand() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j] as T;
+    arr[j] = tmp as T;
+  }
+
+  return arr;
+}
+
 const HIDDEN_FIELD_LABELS = [
   "Índice",
   "Sort Index",
@@ -894,6 +971,10 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [showAnswer, setShowAnswer] = useState(false);
+  type ReviewAnswerStyle = "normal" | "write";
+  const [reviewAnswerStyle, setReviewAnswerStyle] = useState<ReviewAnswerStyle>("normal");
+  const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
+  const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
   const [reviewRef, setReviewRef] = useState<DeckRef | null>(null);
   const [current, setCurrent] = useState<NextCard | null>(null);
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -919,6 +1000,8 @@ export default function Home() {
   // Prevent slow/stale async updates when rapidly advancing cards.
   const loadNextSeqRef = useRef(0);
   const lastOverviewRefreshAtRef = useRef(0);
+
+  // Randomize per-card answer style (50/50) when a new card is shown.
 
   const onSyncFromCloudRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(onSyncFromCloud);
   onSyncFromCloudRef.current = onSyncFromCloud;
@@ -3253,6 +3336,120 @@ export default function Home() {
     !!current &&
     (!Array.isArray(current.card.fieldsHtml) || current.card.fieldsHtml.length === 0);
 
+  const writeExpected = useMemo(() => {
+    if (!current) return null;
+    return pickWriteTargetFromCard({
+      frontHtml: current.card.frontHtml,
+      backHtml: current.card.backHtml,
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+    });
+  }, [current]);
+
+  const writeExpectedChars = useMemo(() => {
+    if (!writeExpected) return [];
+    return toWriteChars(writeExpected);
+  }, [writeExpected]);
+
+  const writeBank = useMemo(() => {
+    if (writeExpectedChars.length === 0) return [];
+    const seed = `${currentId ?? ""}:${writeExpectedChars.join("")}`;
+
+    // Add extra "noise" letters so the answer isn't trivial.
+    const extraCount = Math.min(10, Math.max(4, Math.ceil(writeExpectedChars.length * 0.75)));
+
+    const expectedSet = new Set(
+      writeExpectedChars
+        .map((c) => c.normalize("NFKC").toLowerCase())
+        .filter(Boolean)
+    );
+
+    const baseAlphabet = Array.from("abcdefghijklmnopqrstuvwxyz");
+    const extrasAlphabet = Array.from("áéíóúüñ");
+    const poolLower = baseAlphabet.concat(extrasAlphabet);
+
+    const wantsUpper = writeExpectedChars.length > 0 && writeExpectedChars.every((c) => c === c.toUpperCase());
+    const pool = poolLower
+      .filter((c) => !expectedSet.has(c.normalize("NFKC").toLowerCase()))
+      .map((c) => (wantsUpper ? c.toUpperCase() : c));
+
+    let decoys: string[] = [];
+    if (pool.length > 0) {
+      // If we need more than pool size, repeat with different seeds.
+      let remaining = extraCount;
+      let round = 0;
+      while (remaining > 0) {
+        const batch = seededShuffle(pool, `${seed}:decoys:${round}`);
+        decoys = decoys.concat(batch.slice(0, remaining));
+        remaining -= Math.min(remaining, batch.length);
+        round += 1;
+        if (round > 5) break;
+      }
+    }
+
+    const all = writeExpectedChars.concat(decoys);
+    const shuffled = seededShuffle(all, `${seed}:bank`);
+
+    // Avoid the trivial "not scrambled" case when possible.
+    const same = shuffled.length === writeExpectedChars.length && shuffled.every((ch, i) => ch === writeExpectedChars[i]);
+    return same ? seededShuffle(all, `${seed}:bank:alt`) : shuffled;
+  }, [currentId, writeExpectedChars]);
+
+  const writeUsed = useMemo(() => {
+    return new Set(writePicked.map((p) => p.index));
+  }, [writePicked]);
+
+  const writeIsAvailable = reviewAnswerStyle === "write" && writeExpectedChars.length > 0;
+
+  useEffect(() => {
+    if (mode !== "review") return;
+    if (currentId == null) return;
+
+    const rand01 = () => {
+      try {
+        const buf = new Uint32Array(1);
+        crypto.getRandomValues(buf);
+        return (buf[0] ?? 0) / 4294967296;
+      } catch {
+        return Math.random();
+      }
+    };
+
+    const chosen: ReviewAnswerStyle = rand01() < 0.5 ? "normal" : "write";
+
+    // If write isn't possible for this card, force normal.
+    const canWrite = writeExpectedChars.length > 0;
+    setReviewAnswerStyle(chosen === "write" && !canWrite ? "normal" : chosen);
+
+    // Always start a new card unflipped.
+    setShowAnswer(false);
+  }, [mode, currentId, writeExpectedChars.length]);
+
+  useEffect(() => {
+    // Reset write state when the card changes or the user changes style.
+    setWritePicked([]);
+    setWriteOutcome(null);
+  }, [currentId, reviewAnswerStyle]);
+
+  useEffect(() => {
+    if (mode !== "review") return;
+    if (reviewAnswerStyle !== "write") return;
+    if (!current) return;
+    if (showAnswer) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Backspace") return;
+      if (writePicked.length === 0) return;
+      e.preventDefault();
+      setWritePicked((prev) => prev.slice(0, -1));
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mode, reviewAnswerStyle, currentId, current, showAnswer, writePicked.length]);
+
+  // Write evaluation happens only on explicit Submit.
+
   const promotedSound = useMemo(() => {
     if (!current) return null;
     const fromFront = extractFirstSoundFilename(current.card.frontHtml);
@@ -3913,6 +4110,8 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* Answer style is randomized per card (normal vs write). */}
+
               {current ? (
                 <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-foreground/5 p-6">
                   {currentTimingTag ? (
@@ -3945,18 +4144,112 @@ export default function Home() {
                   ) : null}
 
                   <div className="flex flex-col gap-6">
-                    <div className="py-10">
-                      <CardFace
-                        namespace={activeNamespace}
-                        html={current.card.frontHtml}
-                        suppressFirstSoundFilename={
-                          promotedSound?.source === "front"
-                            ? promotedSound.filename
-                            : null
-                        }
-                        className="text-center text-4xl font-semibold leading-tight tracking-tight"
-                      />
-                    </div>
+                    {reviewAnswerStyle === "write" && !showAnswer ? (
+                      <div className="py-6">
+                        <div className="text-center text-sm text-foreground/70">
+                          Click (or Tab to) the letters to write the word
+                        </div>
+                        {!writeIsAvailable ? (
+                          <div className="mt-3 text-center text-sm text-foreground/70">
+                            Write mode isn’t available for this card.
+                          </div>
+                        ) : (
+                          <>
+                            <div className="mt-4 flex justify-center">
+                              <div className="min-h-14 rounded-2xl border border-foreground/15 bg-background px-5 py-3 text-center text-3xl font-semibold tracking-widest">
+                                {writePicked.length > 0 ? (
+                                  <div className="flex flex-wrap justify-center gap-2">
+                                    {writePicked.map((p, pickedIdx) => (
+                                      <button
+                                        key={`picked-${currentId ?? ""}-${pickedIdx}-${p.index}-${p.ch}`}
+                                        type="button"
+                                        disabled={reviewBusy}
+                                        onClick={() => {
+                                          if (reviewBusy) return;
+                                          setWritePicked((prev) =>
+                                            prev.filter((_, i) => i !== pickedIdx)
+                                          );
+                                        }}
+                                        title="Remove"
+                                        aria-label={p.ch === " " ? "Remove space" : `Remove ${p.ch}`}
+                                        className="inline-flex h-10 min-w-10 items-center justify-center rounded-2xl border border-foreground/15 bg-foreground/5 px-2 text-lg hover:bg-foreground/10 disabled:opacity-50 sm:h-12 sm:min-w-12 sm:px-3 sm:text-2xl"
+                                      >
+                                        {p.ch === " " ? "␣" : p.ch}
+                                      </button>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="text-foreground/30">…</span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="mt-3 flex justify-center">
+                              <button
+                                type="button"
+                                className="h-11 rounded-full bg-foreground px-6 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                                disabled={
+                                  reviewBusy ||
+                                  !writeIsAvailable ||
+                                  writePicked.length === 0
+                                }
+                                onClick={() => {
+                                  if (!writeIsAvailable) return;
+                                  if (writePicked.length === 0) return;
+
+                                  const expected = writeExpectedChars.join("");
+                                  const answer = writePicked.map((p) => p.ch).join("");
+                                  const ok =
+                                    answer.normalize("NFKC").toLowerCase() ===
+                                    expected.normalize("NFKC").toLowerCase();
+
+                                  setWriteOutcome(ok ? "correct" : "wrong");
+                                  setShowAnswer(true);
+                                }}
+                              >
+                                Submit
+                              </button>
+                            </div>
+
+                            <div className="mt-4 flex flex-wrap justify-center gap-2">
+                              {writeBank.map((ch, idx) => {
+                                const used = writeUsed.has(idx);
+                                return (
+                                  <button
+                                    key={`write-${currentId ?? ""}-${idx}-${ch}`}
+                                    type="button"
+                                    disabled={reviewBusy || used}
+                                    onClick={() => {
+                                      if (reviewBusy) return;
+                                      if (used) return;
+                                      setWritePicked((prev) => [...prev, { index: idx, ch }]);
+                                    }}
+                                    className={`h-12 w-12 rounded-2xl border border-foreground/15 text-lg font-semibold hover:bg-foreground/5 disabled:opacity-40 ${
+                                      used ? "bg-foreground/5" : "bg-background"
+                                    }`}
+                                  >
+                                    {ch === " " ? "␣" : ch}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="py-10">
+                        <CardFace
+                          namespace={activeNamespace}
+                          html={current.card.frontHtml}
+                          suppressFirstSoundFilename={
+                            promotedSound?.source === "front"
+                              ? promotedSound.filename
+                              : null
+                          }
+                          className="text-center text-4xl font-semibold leading-tight tracking-tight"
+                        />
+                      </div>
+                    )}
 
                     {showAnswer ? (
                       <div className="border-t border-foreground/15 pt-6">
@@ -4045,29 +4338,37 @@ export default function Home() {
               <div className="flex flex-col gap-3 sm:flex-row">
                 {current ? (
                   !showAnswer ? (
-                    <button
-                      type="button"
-                      className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
-                      onClick={() => setShowAnswer(true)}
-                      disabled={reviewBusy}
-                    >
-                      Show answer
-                    </button>
+                    reviewAnswerStyle === "normal" || !writeIsAvailable ? (
+                      <button
+                        type="button"
+                        className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
+                        onClick={() => setShowAnswer(true)}
+                        disabled={reviewBusy}
+                      >
+                        Show answer
+                      </button>
+                    ) : null
                   ) : (
                     <>
                       <button
                         type="button"
-                        className="h-12 flex-1 rounded-full border border-red-500 px-5 text-sm font-medium text-red-500 hover:bg-red-500 hover:text-background"
+                        className="h-12 flex-1 rounded-full border border-red-500 px-5 text-sm font-medium text-red-500 hover:bg-red-500 hover:text-background disabled:pointer-events-none disabled:border-foreground/20 disabled:bg-foreground/5 disabled:text-foreground/40"
                         onClick={() => void onAnswer("fail")}
-                        disabled={reviewBusy}
+                        disabled={
+                          reviewBusy ||
+                          (reviewAnswerStyle === "write" && writeOutcome === "correct")
+                        }
                       >
                         Fail{nextDueLabels ? ` • ${nextDueLabels.fail}` : ""}
                       </button>
                       <button
                         type="button"
-                        className="h-12 flex-1 rounded-full border border-green-500 px-5 text-sm font-medium text-green-500 hover:bg-green-500 hover:text-background"
+                        className="h-12 flex-1 rounded-full border border-green-500 px-5 text-sm font-medium text-green-500 hover:bg-green-500 hover:text-background disabled:pointer-events-none disabled:border-foreground/20 disabled:bg-foreground/5 disabled:text-foreground/40"
                         onClick={() => void onAnswer("pass")}
-                        disabled={reviewBusy}
+                        disabled={
+                          reviewBusy ||
+                          (reviewAnswerStyle === "write" && writeOutcome === "wrong")
+                        }
                       >
                         Pass{nextDueLabels ? ` • ${nextDueLabels.pass}` : ""}
                       </button>
