@@ -496,6 +496,10 @@ function normalizeLabel(s: string) {
     .replace(/\s+/g, " ");
 }
 
+function escapeRegExp(input: string): string {
+  return String(input ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function toWriteChars(input: string): string[] {
   const normalized = String(input ?? "")
     .trim()
@@ -632,8 +636,35 @@ const HIDDEN_FIELD_LABELS = [
   "Word",
   "word_audio",
   "phrasal_verb_audio",
-  "Anverso de la tarjeta"
+  "Anverso de la tarjeta",
+  "Palabra",
+  "Índice de ordenación",
+  "audio_de_la_palabra",
 ];
+
+// If these fields exist on the note, render them at the very top of the back
+// (answer) view, even though they also remain visible in Card info.
+//
+// Add more labels here as needed; matching is accent/spacing-insensitive.
+const PINNED_BACK_FIELD_LABELS = [
+  "Definiciones 1",
+  "Definiciones 2",
+  "Definiciones 3",
+  "Definitions 1",
+  "Definitions 2",
+  "Definitions 3",
+  "Formas irregulares 1",
+  "Formas irregulares 2",
+  "Formas irregulares 3",
+  "Irregular Forms 1",
+  "Irregular Forms 2",
+  "Irregular Forms 3",
+  "Imagen",
+];
+
+const PINNED_BACK_FIELD_LABELS_NORMALIZED = PINNED_BACK_FIELD_LABELS.map(
+  normalizeLabel
+);
 
 const HIDDEN_FIELD_LABELS_NORMALIZED = new Set(
   HIDDEN_FIELD_LABELS.map(normalizeLabel)
@@ -699,6 +730,32 @@ function inferFieldSectionsForHtml(args: {
     const label = String(names[i] ?? "").trim() || `Field ${i + 1}`;
     if (shouldHideFieldLabel(label)) continue;
     out.push({ index: i, label, valueHtml });
+  }
+
+  return out;
+}
+
+function pickFieldSectionsByLabel(args: {
+  fieldsHtml?: string[];
+  fieldNames?: string[];
+  labelNormalizedInOrder: string[];
+}): Array<{ index: number; label: string; valueHtml: string }> {
+  const fields = Array.isArray(args.fieldsHtml) ? args.fieldsHtml : [];
+  const names = Array.isArray(args.fieldNames) ? args.fieldNames : [];
+  if (fields.length === 0 || names.length === 0) return [];
+
+  const normNames = names.map(normalizeLabel);
+  const out: Array<{ index: number; label: string; valueHtml: string }> = [];
+
+  for (const wantedNorm of args.labelNormalizedInOrder) {
+    if (!wantedNorm) continue;
+    const idx = normNames.findIndex((n) => n === wantedNorm);
+    if (idx < 0) continue;
+    const valueHtml = String(fields[idx] ?? "");
+    if (!valueHtml.trim()) continue;
+
+    const label = String(names[idx] ?? "").trim() || `Field ${idx + 1}`;
+    out.push({ index: idx, label, valueHtml });
   }
 
   return out;
@@ -1253,6 +1310,25 @@ export default function Home() {
     const libraryId = String(args.libraryId ?? "").trim();
     if (!libraryId) return;
 
+    const candidates = extractDeckMediaCandidates(args.deck);
+    if (candidates.length === 0) return;
+
+    // If we don't have any local blobs at all, skip quickly.
+    // (Common on a fresh device that only downloaded deck data.)
+    {
+      const sample = candidates.slice(0, 25);
+      let hasAnyLocal = false;
+      for (const name of sample) {
+        if (!name) continue;
+        const blob = await getMediaBlob(libraryId, name);
+        if (blob && blob.size > 0) {
+          hasAnyLocal = true;
+          break;
+        }
+      }
+      if (!hasAnyLocal) return;
+    }
+
     // Best-effort: if user isn't logged in, just skip.
     const listRes = await fetchWithTimeout(
       `/api/sync/media/list?libraryId=${encodeURIComponent(libraryId)}`,
@@ -1280,9 +1356,6 @@ export default function Home() {
       return new Set(names);
     })();
 
-    const candidates = extractDeckMediaCandidates(args.deck);
-    if (candidates.length === 0) return;
-
     const toUpload: Array<{ name: string; blob: Blob }> = [];
     for (const name of candidates) {
       if (!name) continue;
@@ -1295,8 +1368,9 @@ export default function Home() {
 
     if (toUpload.length === 0) return;
 
-    const MAX_FILES_PER_REQ = 15;
-    const MAX_BYTES_PER_REQ = 8 * 1024 * 1024;
+    // Keep batches small to reduce timeouts on slower connections.
+    const MAX_FILES_PER_REQ = 6;
+    const MAX_BYTES_PER_REQ = 6 * 1024 * 1024;
 
     let batch: Array<{ name: string; blob: Blob }> = [];
     let batchBytes = 0;
@@ -1314,7 +1388,7 @@ export default function Home() {
       const res = await fetchWithTimeout(
         "/api/sync/media/upload",
         { method: "POST", body: form },
-        120_000,
+        180_000,
         "Media upload"
       );
 
@@ -2287,6 +2361,32 @@ export default function Home() {
         })();
       }
 
+      // Best-effort: also retry uploading referenced media for existing local decks.
+      // This helps recover from prior partial media uploads (e.g. audio uploaded but
+      // images didn't) without requiring a re-import.
+      void (async () => {
+        if (!authUser) return;
+        for (const lib of libraries) {
+          try {
+            let deck: ImportedDeck | null = null;
+            try {
+              deck = await exportDeckDataFromStudyDb(lib.id);
+            } catch (e: unknown) {
+              if (isMissingLocalDeckDataError(e)) {
+                deck = await recoverDeckDataFromCachedApkg(lib.id);
+              } else {
+                throw e;
+              }
+            }
+
+            if (!deck) continue;
+            await uploadLibraryMediaToCloudNow({ libraryId: lib.id, deck });
+          } catch {
+            // ignore
+          }
+        }
+      })();
+
       // Download clouds missing locally.
       const importedItems: LibraryItem[] = [];
       for (const lib of toDownload) {
@@ -2299,29 +2399,51 @@ export default function Home() {
           "Deck download"
         );
 
+        let shouldFallbackToApkg = false;
+
         if (dlDeck.ok) {
           const blob = await dlDeck.blob();
           const deck = await decodeDeckDataBlob(blob);
-          const item = await importDeckDataAsLibrary({
-            libraryId: lib.libraryId,
-            libraryName: lib.name,
-            deck,
+
+          // Back-compat guard: if the cloud deck-data is an older/partial format
+          // (missing fields arrays), fall back to downloading the full .apkg.
+          const sample = (deck.cards ?? []).slice(0, 25);
+          const hasLegacyShape = sample.some((c) => {
+            const anyCard = c as unknown as {
+              fieldsHtml?: unknown;
+              fieldNames?: unknown;
+            };
+            return !Array.isArray(anyCard.fieldsHtml) || !Array.isArray(anyCard.fieldNames);
           });
-          importedItems.push(item);
-          advance(`Downloaded “${lib.name}”.`);
-          continue;
+
+          if (!hasLegacyShape) {
+            const item = await importDeckDataAsLibrary({
+              libraryId: lib.libraryId,
+              libraryName: lib.name,
+              deck,
+            });
+            importedItems.push(item);
+            advance(`Downloaded “${lib.name}”.`);
+            continue;
+          }
+
+          shouldFallbackToApkg = true;
+        } else {
+          // Back-compat: older cloud entries store only the .apkg.
+          if (dlDeck.status !== 404) {
+            const errData: unknown = await dlDeck.json().catch(() => null);
+            const msg = (() => {
+              if (!errData || typeof errData !== "object") return null;
+              if (!("error" in errData)) return null;
+              const err = (errData as { error?: unknown }).error;
+              return typeof err === "string" ? err : null;
+            })();
+            throw new Error(msg ?? "Failed to download deck");
+          }
         }
 
-        // Back-compat: older cloud entries store only the .apkg.
-        if (dlDeck.status !== 404) {
-          const errData: unknown = await dlDeck.json().catch(() => null);
-          const msg = (() => {
-            if (!errData || typeof errData !== "object") return null;
-            if (!("error" in errData)) return null;
-            const err = (errData as { error?: unknown }).error;
-            return typeof err === "string" ? err : null;
-          })();
-          throw new Error(msg ?? "Failed to download deck");
+        if (shouldFallbackToApkg === false && dlDeck.status === 404) {
+          // Continue to .apkg fallback below.
         }
 
         const dlApkg = await fetchWithTimeout(
@@ -3720,6 +3842,12 @@ export default function Home() {
       fieldNames: current.card.fieldNames,
     });
   }, [current]);
+
+  const answerFieldLabelsWithoutPinned = useMemo(() => {
+    if (answerFieldLabels.length === 0) return [];
+    const pinned = new Set(PINNED_BACK_FIELD_LABELS_NORMALIZED);
+    return answerFieldLabels.filter((l) => !pinned.has(normalizeLabel(l)));
+  }, [answerFieldLabels]);
   
   const answerFieldSections = useMemo(() => {
     if (!current) return [];
@@ -3729,6 +3857,62 @@ export default function Home() {
       fieldNames: current.card.fieldNames,
     });
   }, [current]);
+
+  const pinnedBackSections = useMemo(() => {
+    if (!current) return [];
+    return pickFieldSectionsByLabel({
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+      labelNormalizedInOrder: PINNED_BACK_FIELD_LABELS_NORMALIZED,
+    });
+  }, [current]);
+
+  const pinnedBackSectionIndexes = useMemo(() => {
+    return new Set(pinnedBackSections.map((s) => s.index));
+  }, [pinnedBackSections]);
+
+  const answerFieldSectionsWithoutPinned = useMemo(() => {
+    if (pinnedBackSectionIndexes.size === 0) return answerFieldSections;
+    return answerFieldSections.filter((sec) => !pinnedBackSectionIndexes.has(sec.index));
+  }, [answerFieldSections, pinnedBackSectionIndexes]);
+
+  const pinnedBackRender = useMemo(() => {
+    const filename =
+      promotedSound?.source === "back" ? promotedSound.filename : null;
+    if (!filename) {
+      return {
+        didSuppressPromotedBackSound: false,
+        sections: pinnedBackSections.map((s) => ({
+          ...s,
+          suppressFirstSoundFilename: null as string | null,
+        })) as Array<
+          {
+            index: number;
+            label: string;
+            valueHtml: string;
+            suppressFirstSoundFilename: string | null;
+          }
+        >,
+      };
+    }
+
+    const re = new RegExp(`\\[sound:\\s*${escapeRegExp(filename)}\\s*\\]`, "i");
+    let suppressed = false;
+
+    const sections: Array<{
+      index: number;
+      label: string;
+      valueHtml: string;
+      suppressFirstSoundFilename: string | null;
+    }> = pinnedBackSections.map((s) => {
+      const contains = re.test(String(s.valueHtml ?? ""));
+      const suppressFirstSoundFilename = !suppressed && contains ? filename : null;
+      if (suppressFirstSoundFilename) suppressed = true;
+      return { ...s, suppressFirstSoundFilename };
+    });
+
+    return { didSuppressPromotedBackSound: suppressed, sections };
+  }, [pinnedBackSections, promotedSound?.filename, promotedSound?.source]);
 
   useEffect(() => {
     if (mode !== "review") return;
@@ -4568,9 +4752,27 @@ export default function Home() {
 
                     {showAnswer ? (
                       <div className="border-t border-foreground/15 pt-6">
-                        {answerFieldSections.length > 0 ? (
+                        {pinnedBackSections.length > 0 ? (
+                          <div className="mb-6 flex flex-col gap-4">
+                            {pinnedBackRender.sections.map((sec) => (
+                              <div key={`pinned-${sec.index}-${sec.label}`}>
+                                <div className="mb-1 text-xs text-center font-medium text-foreground/60">
+                                  {sec.label}:
+                                </div>
+                                <CardFace
+                                  namespace={activeNamespace}
+                                  html={sec.valueHtml}
+                                  suppressFirstSoundFilename={sec.suppressFirstSoundFilename}
+                                  className="text-center text-xl leading-8"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+
+                        {answerFieldSectionsWithoutPinned.length > 0 ? (
                           <div className="flex flex-col gap-4">
-                            {answerFieldSections.map((sec, idx) => (
+                            {answerFieldSectionsWithoutPinned.map((sec, idx) => (
                               <div key={`${sec.index}-${sec.label}`}>
                                 <div className="mb-1 text-xs text-center font-medium text-foreground/60">
                                   {sec.label}:
@@ -4579,7 +4781,9 @@ export default function Home() {
                                   namespace={activeNamespace}
                                   html={sec.valueHtml}
                                   suppressFirstSoundFilename={
-                                    idx === 0 && promotedSound?.source === "back"
+                                    idx === 0 &&
+                                    !pinnedBackRender.didSuppressPromotedBackSound &&
+                                    promotedSound?.source === "back"
                                       ? promotedSound.filename
                                       : null
                                   }
@@ -4590,21 +4794,24 @@ export default function Home() {
                           </div>
                         ) : (
                           <>
-                            {answerFieldLabels.length > 0 ? (
+                            {answerFieldLabelsWithoutPinned.length > 0 ? (
                               <div className="mb-3 text-xs font-medium text-foreground/60">
-                                {answerFieldLabels.join(" • ")}
+                                {answerFieldLabelsWithoutPinned.join(" • ")}
                               </div>
                             ) : null}
-                            <CardFace
-                              namespace={activeNamespace}
-                              html={current.card.backHtml}
-                              suppressFirstSoundFilename={
-                                promotedSound?.source === "back"
-                                  ? promotedSound.filename
-                                  : null
-                              }
-                              className="text-center text-xl leading-8"
-                            />
+                            {pinnedBackSections.length === 0 ? (
+                              <CardFace
+                                namespace={activeNamespace}
+                                html={current.card.backHtml}
+                                suppressFirstSoundFilename={
+                                  !pinnedBackRender.didSuppressPromotedBackSound &&
+                                  promotedSound?.source === "back"
+                                    ? promotedSound.filename
+                                    : null
+                                }
+                                className="text-center text-xl leading-8"
+                              />
+                            ) : null}
                           </>
                         )}
                       </div>
