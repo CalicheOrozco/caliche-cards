@@ -1,6 +1,6 @@
 export type StudyState = "new" | "learn" | "review" | "relearn";
 
-export type ReviewAnswerStyle = "normal" | "write" | "multiple-choice";
+export type ReviewAnswerStyle = "normal" | "write" | "multiple-choice" | "reverse";
 
 export type AnswerResult = "pass" | "fail";
 

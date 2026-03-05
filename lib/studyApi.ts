@@ -50,7 +50,12 @@ export type DeckOverview = {
 };
 
 function sanitizeAnswerStyles(raw: unknown): ReviewAnswerStyle[] {
-  const allowed: ReviewAnswerStyle[] = ["normal", "write", "multiple-choice"];
+  const allowed: ReviewAnswerStyle[] = [
+    "normal",
+    "write",
+    "multiple-choice",
+    "reverse",
+  ];
   if (!Array.isArray(raw)) return allowed;
   const picked = raw.filter((x): x is ReviewAnswerStyle => allowed.includes(x as ReviewAnswerStyle));
   const uniq = Array.from(new Set(picked));

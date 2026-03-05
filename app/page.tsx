@@ -553,6 +553,34 @@ function extractMultipleChoiceAnswerFromBackHtml(backHtml: string): string | nul
   return picked ? picked : null;
 }
 
+function extractReverseChoiceFromFrontHtml(frontHtml: string): string | null {
+  const t = htmlToTextWithBreaks(frontHtml);
+  if (!t) return null;
+
+  // Remove literal sound tags that survive HTML parsing.
+  const cleaned = t.replace(/\[sound:[^\]]+\]/giu, " ");
+
+  const firstLine =
+    cleaned
+      .split("\n")
+      .map((s) => s.trim())
+      .find(Boolean) ?? "";
+  if (!firstLine) return null;
+
+  const beforeSep = firstLine
+    .split(/\s*(?:•|\||;|,|\/|·)\s*/u)[0]
+    ?.trim();
+
+  const picked = String(beforeSep ?? firstLine).replace(/\s+/gu, " ").trim();
+  return picked ? picked : null;
+}
+
+function capitalizeFirstLetter(s: string): string {
+  const t = String(s ?? "").trim();
+  if (!t) return "";
+  return t.charAt(0).toLocaleUpperCase() + t.slice(1);
+}
+
 function extractMultipleChoiceAnswerFromCard(card: {
   frontHtml: string;
   backHtml: string;
@@ -1119,8 +1147,11 @@ export default function Home() {
   const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
   const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
   const [mcOutcome, setMcOutcome] = useState<"correct" | "wrong" | null>(null);
+  const [reverseOutcome, setReverseOutcome] = useState<"correct" | "wrong" | null>(null);
   const [mcAnswerPool, setMcAnswerPool] = useState<string[]>([]);
   const [mcAnswerPoolKey, setMcAnswerPoolKey] = useState<string | null>(null);
+  const [reverseFrontPool, setReverseFrontPool] = useState<string[]>([]);
+  const [reverseFrontPoolKey, setReverseFrontPoolKey] = useState<string | null>(null);
   const [reviewRef, setReviewRef] = useState<DeckRef | null>(null);
   const [current, setCurrent] = useState<NextCard | null>(null);
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -3526,6 +3557,21 @@ export default function Home() {
         setMcAnswerPoolKey(null);
       }
 
+      const reverseEnabled = cfg.answerStyles.includes("reverse");
+      if (reverseEnabled) {
+        try {
+          const pool = await preloadReverseFrontPool(ref);
+          setReverseFrontPool(pool);
+          setReverseFrontPoolKey(`${ref.libraryId}:${ref.deckId}`);
+        } catch {
+          setReverseFrontPool([]);
+          setReverseFrontPoolKey(null);
+        }
+      } else {
+        setReverseFrontPool([]);
+        setReverseFrontPoolKey(null);
+      }
+
       setReviewRef(ref);
       setMode("review");
 
@@ -3664,6 +3710,81 @@ export default function Home() {
     }));
   }, [currentId, mcCorrectAnswer, mcDecoysForCard]);
 
+  const answerFieldSections = useMemo(() => {
+    if (!current) return [];
+    return inferFieldSectionsForHtml({
+      html: current.card.backHtml,
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+    });
+  }, [current]);
+
+  const pinnedBackSections = useMemo(() => {
+    if (!current) return [];
+    return pickFieldSectionsByLabel({
+      fieldsHtml: current.card.fieldsHtml,
+      fieldNames: current.card.fieldNames,
+      labelNormalizedInOrder: PINNED_BACK_FIELD_LABELS_NORMALIZED,
+    });
+  }, [current]);
+
+  const reversePromptHtml = useMemo(() => {
+    if (!current) return null;
+
+    // Prefer the first pinned field (Definitions 1, etc). Otherwise, use the
+    // first inferred back section; else fallback to raw backHtml.
+    const pinnedFirst = pinnedBackSections[0]?.valueHtml ?? null;
+    const inferredFirst = answerFieldSections[0]?.valueHtml ?? null;
+    const raw = pinnedFirst ?? inferredFirst ?? current.card.backHtml;
+    const s = String(raw ?? "");
+    return s.trim() ? s : null;
+  }, [current, pinnedBackSections, answerFieldSections]);
+
+  const reverseCorrectFront = useMemo(() => {
+    if (!current) return null;
+    return extractReverseChoiceFromFrontHtml(current.card.frontHtml);
+  }, [current]);
+
+  const reverseDecoysForCard = useMemo(() => {
+    if (!reverseCorrectFront) return [];
+    const wantsKey = reviewRef ? `${reviewRef.libraryId}:${reviewRef.deckId}` : null;
+    if (reverseFrontPoolKey !== wantsKey) return [];
+    const correctKey = normalizeChoiceText(reverseCorrectFront);
+    return reverseFrontPool.filter((x) => normalizeChoiceText(x) !== correctKey);
+  }, [reverseCorrectFront, reverseFrontPool, reverseFrontPoolKey, reviewRef]);
+
+  const reverseOptions = useMemo(() => {
+    if (!currentId) return [];
+    if (!reverseCorrectFront) return [];
+    if (!reversePromptHtml) return [];
+
+    const seed = `${currentId}:${normalizeChoiceText(reverseCorrectFront)}`;
+    const shuffledDecoys = seededShuffle(reverseDecoysForCard, `${seed}:decoys`);
+    const pickedDecoys = shuffledDecoys.slice(0, 3);
+
+    const correctKey = normalizeChoiceText(reverseCorrectFront);
+    const uniq: Array<{ label: string; key: string }> = [];
+    const seen = new Set<string>();
+    const add = (label: string) => {
+      const key = normalizeChoiceText(label);
+      if (!key) return;
+      if (seen.has(key)) return;
+      seen.add(key);
+      uniq.push({ label: capitalizeFirstLetter(label), key });
+    };
+
+    add(reverseCorrectFront);
+    for (const d of pickedDecoys) add(d);
+
+    if (uniq.length < 2) return [];
+
+    const shuffled = seededShuffle(uniq, `${seed}:options`);
+    return shuffled.map((o) => ({
+      label: o.label,
+      isCorrect: o.key === correctKey,
+    }));
+  }, [currentId, reverseCorrectFront, reverseDecoysForCard, reversePromptHtml]);
+
   const writeBank = useMemo(() => {
     if (writeExpectedChars.length === 0) return [];
     const seed = `${currentId ?? ""}:${writeExpectedChars.join("")}`;
@@ -3714,6 +3835,7 @@ export default function Home() {
 
   const writeIsAvailable = reviewAnswerStyle === "write" && writeExpectedChars.length > 0;
   const mcCanRun = Boolean(mcCorrectAnswer) && mcDecoysForCard.length > 0;
+  const reverseCanRun = Boolean(reversePromptHtml) && Boolean(reverseCorrectFront) && reverseDecoysForCard.length > 0;
 
   async function preloadMcAnswerPool(ref: DeckRef): Promise<string[]> {
     const db = getStudyDb();
@@ -3743,6 +3865,29 @@ export default function Home() {
     return answers;
   }
 
+  async function preloadReverseFrontPool(ref: DeckRef): Promise<string[]> {
+    const db = getStudyDb();
+    const cards = await db.cards
+      .where("[libraryId+deckId]")
+      .equals([ref.libraryId, ref.deckId])
+      .limit(400)
+      .toArray();
+
+    const fronts: string[] = [];
+    const seen = new Set<string>();
+    for (const c of cards) {
+      const a = extractReverseChoiceFromFrontHtml(c.frontHtml);
+      if (!a) continue;
+      const key = normalizeChoiceText(a);
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fronts.push(a);
+      if (fronts.length >= 220) break;
+    }
+    return fronts;
+  }
+
   useEffect(() => {
     if (mode !== "review") return;
     if (currentId == null) return;
@@ -3760,16 +3905,18 @@ export default function Home() {
     const enabledStyles: ReviewAnswerStyle[] =
       reviewDeckConfig?.answerStyles?.length
         ? reviewDeckConfig.answerStyles
-        : ["normal", "write", "multiple-choice"];
+        : ["normal", "write", "multiple-choice", "reverse"];
 
     const canWrite = writeExpectedChars.length > 0;
     const canMc = Boolean(mcCorrectAnswer) && mcDecoysForCard.length > 0;
+    const canReverse = Boolean(reversePromptHtml) && Boolean(reverseCorrectFront) && reverseDecoysForCard.length > 0;
 
     const available: ReviewAnswerStyle[] = [];
     for (const s of enabledStyles) {
       if (s === "normal") available.push("normal");
       else if (s === "write" && canWrite) available.push("write");
       else if (s === "multiple-choice" && canMc) available.push("multiple-choice");
+      else if (s === "reverse" && canReverse) available.push("reverse");
     }
 
     // Fallback: never block review just because a style can't run.
@@ -3795,6 +3942,7 @@ export default function Home() {
     setWritePicked([]);
     setWriteOutcome(null);
     setMcOutcome(null);
+    setReverseOutcome(null);
   }, [currentId, reviewAnswerStyle]);
 
   useEffect(() => {
@@ -3857,24 +4005,6 @@ export default function Home() {
     const pinned = new Set(PINNED_BACK_FIELD_LABELS_NORMALIZED);
     return answerFieldLabels.filter((l) => !pinned.has(normalizeLabel(l)));
   }, [answerFieldLabels]);
-  
-  const answerFieldSections = useMemo(() => {
-    if (!current) return [];
-    return inferFieldSectionsForHtml({
-      html: current.card.backHtml,
-      fieldsHtml: current.card.fieldsHtml,
-      fieldNames: current.card.fieldNames,
-    });
-  }, [current]);
-
-  const pinnedBackSections = useMemo(() => {
-    if (!current) return [];
-    return pickFieldSectionsByLabel({
-      fieldsHtml: current.card.fieldsHtml,
-      fieldNames: current.card.fieldNames,
-      labelNormalizedInOrder: PINNED_BACK_FIELD_LABELS_NORMALIZED,
-    });
-  }, [current]);
 
   const pinnedBackSectionIndexes = useMemo(() => {
     return new Set(pinnedBackSections.map((s) => s.index));
@@ -4430,12 +4560,14 @@ export default function Home() {
                                         { id: "normal" as const, label: "Normal" },
                                         { id: "write" as const, label: "Write" },
                                         { id: "multiple-choice" as const, label: "Multiple-choice" },
+                                        { id: "reverse" as const, label: "Reverse" },
                                       ] satisfies Array<{ id: ReviewAnswerStyle; label: string }>
                                     ).map((opt) => {
                                       const currentStyles = (overview?.config.answerStyles ?? [
                                         "normal",
                                         "write",
                                         "multiple-choice",
+                                        "reverse",
                                       ]) as ReviewAnswerStyle[];
                                       const checked = currentStyles.includes(opt.id);
 
@@ -4721,6 +4853,19 @@ export default function Home() {
                           </>
                         )}
                       </div>
+                    ) : reviewAnswerStyle === "reverse" && !showAnswer ? (
+                      <div className="py-10">
+                        <CardFace
+                          namespace={activeNamespace}
+                          html={reversePromptHtml ?? current.card.backHtml}
+                          suppressFirstSoundFilename={
+                            promotedSound?.source === "back"
+                              ? promotedSound.filename
+                              : null
+                          }
+                          className="text-center text-xl leading-8"
+                        />
+                      </div>
                     ) : (
                       <div className="py-10">
                         <CardFace
@@ -4783,38 +4928,109 @@ export default function Home() {
                       </div>
                     ) : null}
 
-                    {showAnswer ? (
-                      <div className="border-t border-foreground/15 pt-6">
-                        {pinnedBackSections.length > 0 ? (
-                          <div className="mb-6 flex flex-col gap-4">
-                            {pinnedBackRender.sections.map((sec) => (
-                              <div key={`pinned-${sec.index}-${sec.label}`}>
-                                <div className="mb-1 text-xs text-center font-medium text-foreground/60">
-                                  {sec.label}:
-                                </div>
-                                <CardFace
-                                  namespace={activeNamespace}
-                                  html={sec.valueHtml}
-                                  suppressFirstSoundFilename={sec.suppressFirstSoundFilename}
-                                  className="text-center text-xl leading-8"
-                                />
-                              </div>
-                            ))}
+                    {reviewAnswerStyle === "reverse" && !showAnswer ? (
+                      <div className="pb-2">
+                        <div className="text-center text-sm text-foreground/70">
+                          Choose the correct front
+                        </div>
+                        {reverseOutcome != null ? (
+                          <div
+                            className={`mt-2 text-center text-sm font-medium ${
+                              reverseOutcome === "correct"
+                                ? "text-green-500"
+                                : "text-red-400"
+                            }`}
+                          >
+                            {reverseOutcome === "correct" ? "Correct" : "Wrong"}
                           </div>
                         ) : null}
 
-                        {answerFieldSectionsWithoutPinned.length > 0 ? (
-                          <div className="flex flex-col gap-4">
-                            {answerFieldSectionsWithoutPinned.map((sec, idx) => (
-                              <div key={`${sec.index}-${sec.label}`}>
-                                <div className="mb-1 text-xs text-center font-medium text-foreground/60">
-                                  {sec.label}:
+                        {!reverseCanRun ? (
+                          <div className="mt-3 text-center text-sm text-foreground/70">
+                            Reverse mode isn’t available for this card.
+                          </div>
+                        ) : (
+                          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                            {reverseOptions.map((opt, idx) => (
+                              <button
+                                key={`rev-${currentId ?? ""}-${idx}-${opt.label}`}
+                                type="button"
+                                disabled={reviewBusy || reverseOutcome != null}
+                                onClick={() => {
+                                  if (reviewBusy) return;
+                                  if (reverseOutcome != null) return;
+
+                                  const ok = Boolean(opt.isCorrect);
+                                  setReverseOutcome(ok ? "correct" : "wrong");
+                                }}
+                                className="min-h-12 rounded-2xl border border-foreground/15 bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-60"
+                              >
+                                <span className="mr-2 text-foreground/60">
+                                  {String.fromCharCode(65 + (idx % 26))}.
+                                </span>
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
+
+                    {showAnswer ? (
+                      <div className="border-t border-foreground/15 pt-6">
+                        <>
+                          {pinnedBackSections.length > 0 ? (
+                            <div className="mb-6 flex flex-col gap-4">
+                              {pinnedBackRender.sections.map((sec) => (
+                                <div key={`pinned-${sec.index}-${sec.label}`}>
+                                  <div className="mb-1 text-xs text-center font-medium text-foreground/60">
+                                    {sec.label}:
+                                  </div>
+                                  <CardFace
+                                    namespace={activeNamespace}
+                                    html={sec.valueHtml}
+                                    suppressFirstSoundFilename={sec.suppressFirstSoundFilename}
+                                    className="text-center text-xl leading-8"
+                                  />
                                 </div>
+                              ))}
+                            </div>
+                          ) : null}
+
+                          {answerFieldSectionsWithoutPinned.length > 0 ? (
+                            <div className="flex flex-col gap-4">
+                              {answerFieldSectionsWithoutPinned.map((sec, idx) => (
+                                <div key={`${sec.index}-${sec.label}`}>
+                                  <div className="mb-1 text-xs text-center font-medium text-foreground/60">
+                                    {sec.label}:
+                                  </div>
+                                  <CardFace
+                                    namespace={activeNamespace}
+                                    html={sec.valueHtml}
+                                    suppressFirstSoundFilename={
+                                      idx === 0 &&
+                                      !pinnedBackRender.didSuppressPromotedBackSound &&
+                                      promotedSound?.source === "back"
+                                        ? promotedSound.filename
+                                        : null
+                                    }
+                                    className="text-center text-xl leading-8"
+                                  />
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <>
+                              {answerFieldLabelsWithoutPinned.length > 0 ? (
+                                <div className="mb-3 text-xs font-medium text-foreground/60">
+                                  {answerFieldLabelsWithoutPinned.join(" • ")}
+                                </div>
+                              ) : null}
+                              {pinnedBackSections.length === 0 ? (
                                 <CardFace
                                   namespace={activeNamespace}
-                                  html={sec.valueHtml}
+                                  html={current.card.backHtml}
                                   suppressFirstSoundFilename={
-                                    idx === 0 &&
                                     !pinnedBackRender.didSuppressPromotedBackSound &&
                                     promotedSound?.source === "back"
                                       ? promotedSound.filename
@@ -4822,31 +5038,10 @@ export default function Home() {
                                   }
                                   className="text-center text-xl leading-8"
                                 />
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <>
-                            {answerFieldLabelsWithoutPinned.length > 0 ? (
-                              <div className="mb-3 text-xs font-medium text-foreground/60">
-                                {answerFieldLabelsWithoutPinned.join(" • ")}
-                              </div>
-                            ) : null}
-                            {pinnedBackSections.length === 0 ? (
-                              <CardFace
-                                namespace={activeNamespace}
-                                html={current.card.backHtml}
-                                suppressFirstSoundFilename={
-                                  !pinnedBackRender.didSuppressPromotedBackSound &&
-                                  promotedSound?.source === "back"
-                                    ? promotedSound.filename
-                                    : null
-                                }
-                                className="text-center text-xl leading-8"
-                              />
-                            ) : null}
-                          </>
-                        )}
+                              ) : null}
+                            </>
+                          )}
+                        </>
                       </div>
                     ) : null}
 
@@ -4896,8 +5091,10 @@ export default function Home() {
                     reviewAnswerStyle === "normal" ||
                     (reviewAnswerStyle === "write" && !writeIsAvailable) ||
                     (reviewAnswerStyle === "multiple-choice" && !mcCanRun) ||
+                    (reviewAnswerStyle === "reverse" && !reverseCanRun) ||
                     (reviewAnswerStyle === "write" && writeOutcome != null) ||
-                    (reviewAnswerStyle === "multiple-choice" && mcOutcome != null) ? (
+                    (reviewAnswerStyle === "multiple-choice" && mcOutcome != null) ||
+                    (reviewAnswerStyle === "reverse" && reverseOutcome != null) ? (
                       <button
                         type="button"
                         className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
@@ -4909,6 +5106,9 @@ export default function Home() {
                           : reviewAnswerStyle === "multiple-choice" &&
                               mcOutcome != null
                             ? "Reveal answer"
+                            : reviewAnswerStyle === "reverse" &&
+                                reverseOutcome != null
+                              ? "Reveal answer"
                             : "Show answer"}
                       </button>
                     ) : null
@@ -4921,6 +5121,7 @@ export default function Home() {
                         disabled={
                           reviewBusy ||
                           (reviewAnswerStyle === "multiple-choice" && mcOutcome === "correct")
+                          || (reviewAnswerStyle === "reverse" && reverseOutcome === "correct")
                         }
                       >
                         Fail{nextDueLabels ? ` • ${nextDueLabels.fail}` : ""}
@@ -4932,7 +5133,8 @@ export default function Home() {
                         disabled={
                           reviewBusy ||
                           (reviewAnswerStyle === "write" && writeOutcome === "wrong") ||
-                          (reviewAnswerStyle === "multiple-choice" && mcOutcome === "wrong")
+                          (reviewAnswerStyle === "multiple-choice" && mcOutcome === "wrong") ||
+                          (reviewAnswerStyle === "reverse" && reverseOutcome === "wrong")
                         }
                       >
                         Pass{nextDueLabels ? ` • ${nextDueLabels.pass}` : ""}
