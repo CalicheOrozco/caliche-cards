@@ -46,7 +46,7 @@ export type DeckOverview = {
   newShown: number;
   reviewShown: number;
 
-  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay" | "cardInfoOpenByDefault" | "answerStyles">;
+  config: Pick<DeckConfig, "newPerDay" | "reviewsPerDay" | "cardInfoOpenByDefault" | "answerStyles" | "writeLanguage">;
 };
 
 function sanitizeAnswerStyles(raw: unknown): ReviewAnswerStyle[] {
@@ -60,6 +60,13 @@ function sanitizeAnswerStyles(raw: unknown): ReviewAnswerStyle[] {
   const picked = raw.filter((x): x is ReviewAnswerStyle => allowed.includes(x as ReviewAnswerStyle));
   const uniq = Array.from(new Set(picked));
   return uniq.length > 0 ? uniq : allowed;
+}
+
+function sanitizeWriteLanguage(raw: unknown): DeckConfig["writeLanguage"] {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "fr") return "fr";
+  if (v === "es") return "es";
+  return "en";
 }
 
 function isAvailable(state: CardStateEntity, now: number): boolean {
@@ -79,7 +86,38 @@ export async function getDeckConfig(ref: DeckRef): Promise<DeckConfig> {
     reviewsPerDay: deck.reviewsPerDay,
     cardInfoOpenByDefault: Boolean(deck.cardInfoOpenByDefault),
     answerStyles: sanitizeAnswerStyles((deck as { answerStyles?: unknown }).answerStyles),
+    writeLanguage: sanitizeWriteLanguage((deck as { writeLanguage?: unknown }).writeLanguage),
   };
+}
+
+export async function setDeckWriteLanguage(
+  ref: DeckRef,
+  writeLanguage: DeckConfig["writeLanguage"]
+): Promise<void> {
+  const db = getStudyDb();
+  const next = sanitizeWriteLanguage(writeLanguage);
+  const now = Date.now();
+
+  const updated = await db.decks.update([ref.libraryId, ref.deckId], {
+    writeLanguage: next,
+    updatedAt: now,
+  });
+
+  // If the deck row doesn't exist yet (race with initial seeding), create it.
+  if (updated === 0) {
+    await db.decks.put({
+      libraryId: ref.libraryId,
+      deckId: ref.deckId,
+      name: "",
+      newPerDay: DEFAULT_DECK_CONFIG.newPerDay,
+      reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
+      cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
+      answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
+      writeLanguage: next,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
 }
 
 export async function setDeckCardInfoOpenByDefault(
@@ -105,6 +143,7 @@ export async function setDeckCardInfoOpenByDefault(
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
       cardInfoOpenByDefault: next,
       answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
+      writeLanguage: DEFAULT_DECK_CONFIG.writeLanguage,
       createdAt: now,
       updatedAt: now,
     });
@@ -131,6 +170,7 @@ export async function setDeckNewPerDay(ref: DeckRef, newPerDay: number): Promise
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
       cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
       answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
+      writeLanguage: DEFAULT_DECK_CONFIG.writeLanguage,
       createdAt: now,
       updatedAt: now,
     });
@@ -157,6 +197,7 @@ export async function setDeckAnswerStyles(ref: DeckRef, styles: ReviewAnswerStyl
       reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
       cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
       answerStyles: next,
+      writeLanguage: DEFAULT_DECK_CONFIG.writeLanguage,
       createdAt: now,
       updatedAt: 0,
     });
@@ -183,6 +224,7 @@ export async function upsertImportedDeck(libraryId: string, imported: ImportedDe
         cardInfoOpenByDefault:
           prev?.cardInfoOpenByDefault ?? DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
         answerStyles: sanitizeAnswerStyles((prev as { answerStyles?: unknown } | null)?.answerStyles),
+        writeLanguage: sanitizeWriteLanguage((prev as { writeLanguage?: unknown } | null)?.writeLanguage),
         createdAt: prev?.createdAt ?? now,
         updatedAt: now,
       };
@@ -523,6 +565,7 @@ export async function getDeckOverview(ref: DeckRef): Promise<DeckOverview> {
       reviewsPerDay: cfg.reviewsPerDay,
       cardInfoOpenByDefault: cfg.cardInfoOpenByDefault,
       answerStyles: cfg.answerStyles,
+      writeLanguage: cfg.writeLanguage,
     },
   };
 }

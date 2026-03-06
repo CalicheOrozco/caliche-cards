@@ -19,6 +19,9 @@ export type DeckConfig = {
   // UI preference: which answer styles may be shown during review.
   answerStyles: ReviewAnswerStyle[];
 
+  // Write mode: which alphabet/extra letters to offer as decoys.
+  writeLanguage: "en" | "fr" | "es";
+
   // Learning / relearning delays after a PASS while in learn/relearn.
   learnStepsMs: number[];
   relearnStepsMs: number[];
@@ -52,6 +55,9 @@ export type DeckEntity = {
 
   // UI preference (not used by scheduler).
   answerStyles?: ReviewAnswerStyle[];
+
+  // UI preference (not used by scheduler).
+  writeLanguage?: "en" | "fr" | "es";
 
   createdAt: number;
   updatedAt: number;

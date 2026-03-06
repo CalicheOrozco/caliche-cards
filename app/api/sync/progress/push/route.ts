@@ -9,6 +9,13 @@ function isProbablyUuid(v: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
+function sanitizeWriteLanguage(raw: unknown): "en" | "fr" | "es" {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "fr") return "fr";
+  if (v === "es") return "es";
+  return "en";
+}
+
 type CardStatePayload = {
   libraryId: string;
   cardId: number;
@@ -65,6 +72,7 @@ type DeckConfigPayload = {
   newPerDay: number;
   reviewsPerDay: number;
   cardInfoOpenByDefault?: boolean;
+  writeLanguage?: "en" | "fr" | "es";
   updatedAt: number;
 };
 
@@ -149,6 +157,7 @@ export async function POST(req: NextRequest) {
       newPerDay: typeof d.newPerDay === "number" ? d.newPerDay : Number(d.newPerDay),
       reviewsPerDay: typeof d.reviewsPerDay === "number" ? d.reviewsPerDay : Number(d.reviewsPerDay),
       cardInfoOpenByDefault: Boolean((d as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
+      writeLanguage: sanitizeWriteLanguage((d as { writeLanguage?: unknown }).writeLanguage),
       updatedAt: typeof d.updatedAt === "number" ? d.updatedAt : Number(d.updatedAt),
     }))
     .filter((d) => Number.isFinite(d.deckId) && d.deckId > 0)
@@ -159,6 +168,7 @@ export async function POST(req: NextRequest) {
       newPerDay: Number.isFinite(d.newPerDay) ? Math.max(0, Math.floor(d.newPerDay)) : 0,
       reviewsPerDay: Number.isFinite(d.reviewsPerDay) ? Math.max(0, Math.floor(d.reviewsPerDay)) : 0,
       cardInfoOpenByDefault: Boolean(d.cardInfoOpenByDefault),
+      writeLanguage: sanitizeWriteLanguage(d.writeLanguage),
       updatedAt: d.updatedAt,
     }));
 
@@ -276,6 +286,7 @@ export async function POST(req: NextRequest) {
             newPerDay: d.newPerDay,
             reviewsPerDay: d.reviewsPerDay,
             cardInfoOpenByDefault: Boolean(d.cardInfoOpenByDefault),
+            writeLanguage: sanitizeWriteLanguage(d.writeLanguage),
             updatedAt: d.updatedAt,
             uploadedAt: now,
           },

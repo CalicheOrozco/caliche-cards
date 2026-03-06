@@ -31,6 +31,7 @@ import {
   setDeckAnswerStyles,
   setDeckCardInfoOpenByDefault,
   setDeckNewPerDay,
+  setDeckWriteLanguage,
   startStudySession,
   upsertImportedDeck,
   type DeckOverview,
@@ -52,9 +53,17 @@ type ProgressPullResponse = {
     newPerDay: number;
     reviewsPerDay: number;
     cardInfoOpenByDefault?: boolean;
+    writeLanguage?: "en" | "fr" | "es";
     updatedAt: number;
   }>;
 };
+
+function sanitizeWriteLanguage(raw: unknown): DeckConfig["writeLanguage"] {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "fr") return "fr";
+  if (v === "es") return "es";
+  return "en";
+}
 
 function computeReviewLogSyncKey(log: {
   libraryId: string;
@@ -2605,6 +2614,7 @@ export default function Home() {
                 newPerDay: d.newPerDay,
                 reviewsPerDay: d.reviewsPerDay,
                 cardInfoOpenByDefault: Boolean((d as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
+                writeLanguage: sanitizeWriteLanguage((d as { writeLanguage?: unknown }).writeLanguage),
                 updatedAt: d.updatedAt,
               })),
             }),
@@ -2724,6 +2734,7 @@ export default function Home() {
                 newPerDay: Math.max(0, Math.floor(Number(cfg.newPerDay) || 0)),
                 reviewsPerDay: Math.max(0, Math.floor(Number(cfg.reviewsPerDay) || 0)),
                 cardInfoOpenByDefault: Boolean((cfg as { cardInfoOpenByDefault?: unknown }).cardInfoOpenByDefault),
+                writeLanguage: sanitizeWriteLanguage((cfg as { writeLanguage?: unknown }).writeLanguage),
                 answerStyles:
                   Array.isArray(local?.answerStyles) && local.answerStyles.length > 0
                     ? local.answerStyles
@@ -3034,6 +3045,39 @@ export default function Home() {
     [reviewRef]
   );
 
+  const commitDeckWriteLanguage = useCallback(
+    async (libraryId: string, deckId: number, next: DeckConfig["writeLanguage"]) => {
+      await setDeckWriteLanguage({ libraryId, deckId }, next);
+
+      // Optimistically reflect in UI even if overview refresh lags.
+      setDeckOverviews((prev) => {
+        const key = `${libraryId}:${deckId}`;
+        const existing = prev[key];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          [key]: {
+            ...existing,
+            config: {
+              ...existing.config,
+              writeLanguage: next,
+            },
+          },
+        };
+      });
+
+      const ov = await getDeckOverview({ libraryId, deckId });
+      setDeckOverviews((prev) => ({ ...prev, [`${libraryId}:${deckId}`]: ov }));
+
+      if (reviewRef?.libraryId === libraryId && reviewRef.deckId === deckId) {
+        setReviewOverview(ov);
+        const cfg = await getDeckConfig({ libraryId, deckId });
+        setReviewDeckConfig(cfg);
+      }
+    },
+    [reviewRef]
+  );
+
   useEffect(() => {
     if (!openDeckMenu) return;
 
@@ -3152,6 +3196,7 @@ export default function Home() {
             reviewsPerDay: DEFAULT_DECK_CONFIG.reviewsPerDay,
             cardInfoOpenByDefault: DEFAULT_DECK_CONFIG.cardInfoOpenByDefault,
             answerStyles: DEFAULT_DECK_CONFIG.answerStyles,
+            writeLanguage: DEFAULT_DECK_CONFIG.writeLanguage,
             createdAt: now,
             updatedAt: now,
           });
@@ -3664,7 +3709,14 @@ export default function Home() {
     );
 
     const baseAlphabet = Array.from("abcdefghijklmnopqrstuvwxyz");
-    const extrasAlphabet = Array.from("áéíóúüñ");
+    const writeLanguage: DeckConfig["writeLanguage"] =
+      reviewDeckConfig?.writeLanguage ?? DEFAULT_DECK_CONFIG.writeLanguage;
+    const extrasAlphabet =
+      writeLanguage === "fr"
+        ? Array.from("àâäæçéèêëîïôœùûüÿ")
+        : writeLanguage === "es"
+          ? Array.from("áéíóúüñ")
+          : [];
     const poolLower = baseAlphabet.concat(extrasAlphabet);
 
     const wantsUpper = writeExpectedChars.length > 0 && writeExpectedChars.every((c) => c === c.toUpperCase());
@@ -3692,7 +3744,7 @@ export default function Home() {
     // Avoid the trivial "not scrambled" case when possible.
     const same = shuffled.length === writeExpectedChars.length && shuffled.every((ch, i) => ch === writeExpectedChars[i]);
     return same ? seededShuffle(all, `${seed}:bank:alt`) : shuffled;
-  }, [currentId, writeExpectedChars]);
+  }, [currentId, writeExpectedChars, reviewDeckConfig?.writeLanguage]);
 
   const writeUsed = useMemo(() => {
     return new Set(writePicked.map((p) => p.index));
@@ -4468,6 +4520,25 @@ export default function Home() {
                                         </label>
                                       );
                                     })}
+                                  </div>
+
+                                  <div className="px-3 py-2">
+                                    <div className="text-xs text-foreground/70">Write language</div>
+                                    <select
+                                      className="mt-1 w-full rounded-lg border border-foreground/15 bg-background px-3 py-2 text-sm"
+                                      value={
+                                        overview?.config.writeLanguage ??
+                                        DEFAULT_DECK_CONFIG.writeLanguage
+                                      }
+                                      onChange={(e) => {
+                                        const next = sanitizeWriteLanguage(e.currentTarget.value);
+                                        void commitDeckWriteLanguage(lib.id, d.id, next);
+                                      }}
+                                    >
+                                      <option value="en">English</option>
+                                      <option value="fr">Français</option>
+                                      <option value="es">Español</option>
+                                    </select>
                                   </div>
 
                                   <button
