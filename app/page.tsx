@@ -1155,7 +1155,9 @@ export default function Home() {
   const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
   const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
   const [mcOutcome, setMcOutcome] = useState<"correct" | "wrong" | null>(null);
+  const [mcSelectedIndex, setMcSelectedIndex] = useState<number | null>(null);
   const [reverseOutcome, setReverseOutcome] = useState<"correct" | "wrong" | null>(null);
+  const [reverseSelectedIndex, setReverseSelectedIndex] = useState<number | null>(null);
   const [mcAnswerPool, setMcAnswerPool] = useState<string[]>([]);
   const [mcAnswerPoolKey, setMcAnswerPoolKey] = useState<string | null>(null);
   const [reverseFrontPool, setReverseFrontPool] = useState<string[]>([]);
@@ -3810,7 +3812,9 @@ export default function Home() {
     setWritePicked([]);
     setWriteOutcome(null);
     setMcOutcome(null);
+    setMcSelectedIndex(null);
     setReverseOutcome(null);
+    setReverseSelectedIndex(null);
   }, [currentId, reviewAnswerStyle]);
 
   useEffect(() => {
@@ -4621,17 +4625,6 @@ export default function Home() {
                         <div className="text-center text-sm text-foreground/70">
                           Click (or Tab to) the letters to write the word
                         </div>
-                        {writeOutcome != null ? (
-                          <div
-                            className={`mt-2 text-center text-sm font-medium ${
-                              writeOutcome === "correct"
-                                ? "text-green-500"
-                                : "text-red-400"
-                            }`}
-                          >
-                            {writeOutcome === "correct" ? "Correct" : "Wrong"}
-                          </div>
-                        ) : null}
                         {!writeIsAvailable ? (
                           <div className="mt-3 text-center text-sm text-foreground/70">
                             Write mode isn’t available for this card.
@@ -4639,7 +4632,15 @@ export default function Home() {
                         ) : (
                           <>
                             <div className="mt-4 flex justify-center">
-                              <div className="min-h-14 rounded-2xl border border-foreground/15 bg-background px-5 py-3 text-center text-3xl font-semibold tracking-widest">
+                              <div
+                                className={`min-h-14 rounded-2xl border bg-background px-5 py-3 text-center text-3xl font-semibold tracking-widest ${
+                                  writeOutcome == null
+                                    ? "border-foreground/15"
+                                    : writeOutcome === "correct"
+                                      ? "border-green-500 bg-green-500/5"
+                                      : "border-red-500 bg-red-500/5"
+                                }`}
+                              >
                                 {writePicked.length > 0 ? (
                                   <div className="flex flex-wrap justify-center gap-2">
                                     {writePicked.map((p, pickedIdx) => (
@@ -4656,7 +4657,13 @@ export default function Home() {
                                         }}
                                         title="Remove"
                                         aria-label={p.ch === " " ? "Remove space" : `Remove ${p.ch}`}
-                                        className="inline-flex h-10 min-w-10 items-center justify-center rounded-2xl border border-foreground/15 bg-foreground/5 px-2 text-lg hover:bg-foreground/10 disabled:opacity-50 sm:h-12 sm:min-w-12 sm:px-3 sm:text-2xl"
+                                        className={`inline-flex h-10 min-w-10 items-center justify-center rounded-2xl border px-2 text-lg hover:bg-foreground/10 disabled:opacity-60 sm:h-12 sm:min-w-12 sm:px-3 sm:text-2xl ${
+                                          writeOutcome == null
+                                            ? "border-foreground/15 bg-foreground/5"
+                                            : writeOutcome === "correct"
+                                              ? "border-green-500 bg-green-500/10 text-green-500"
+                                              : "border-red-500 bg-red-500/10 text-red-500"
+                                        }`}
                                       >
                                         {p.ch === " " ? "␣" : p.ch}
                                       </button>
@@ -4756,17 +4763,6 @@ export default function Home() {
                         <div className="text-center text-sm text-foreground/70">
                           Choose the correct answer
                         </div>
-                        {mcOutcome != null ? (
-                          <div
-                            className={`mt-2 text-center text-sm font-medium ${
-                              mcOutcome === "correct"
-                                ? "text-green-500"
-                                : "text-red-400"
-                            }`}
-                          >
-                            {mcOutcome === "correct" ? "Correct" : "Wrong"}
-                          </div>
-                        ) : null}
                         {!mcCanRun ? (
                           <div className="mt-3 text-center text-sm text-foreground/70">
                             Multiple-choice isn’t available for this card.
@@ -4783,9 +4779,18 @@ export default function Home() {
                                   if (mcOutcome != null) return;
 
                                   const ok = Boolean(opt.isCorrect);
+                                  setMcSelectedIndex(idx);
                                   setMcOutcome(ok ? "correct" : "wrong");
                                 }}
-                                className="min-h-12 rounded-2xl border border-foreground/15 bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-60"
+                                className={`min-h-12 rounded-2xl border bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-80 ${
+                                  mcOutcome == null
+                                    ? "border-foreground/15"
+                                    : opt.isCorrect
+                                      ? "border-green-500 bg-green-500/5"
+                                      : mcSelectedIndex === idx
+                                        ? "border-red-500 bg-red-500/5"
+                                        : "border-foreground/10 opacity-60"
+                                }`}
                               >
                                 <span className="mr-2 text-foreground/60">
                                   {String.fromCharCode(65 + (idx % 26))}.
@@ -4803,18 +4808,6 @@ export default function Home() {
                         <div className="text-center text-sm text-foreground/70">
                           Choose the correct front
                         </div>
-                        {reverseOutcome != null ? (
-                          <div
-                            className={`mt-2 text-center text-sm font-medium ${
-                              reverseOutcome === "correct"
-                                ? "text-green-500"
-                                : "text-red-400"
-                            }`}
-                          >
-                            {reverseOutcome === "correct" ? "Correct" : "Wrong"}
-                          </div>
-                        ) : null}
-
                         {!reverseCanRun ? (
                           <div className="mt-3 text-center text-sm text-foreground/70">
                             Reverse mode isn’t available for this card.
@@ -4831,9 +4824,18 @@ export default function Home() {
                                   if (reverseOutcome != null) return;
 
                                   const ok = Boolean(opt.isCorrect);
+                                  setReverseSelectedIndex(idx);
                                   setReverseOutcome(ok ? "correct" : "wrong");
                                 }}
-                                className="min-h-12 rounded-2xl border border-foreground/15 bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-60"
+                                className={`min-h-12 rounded-2xl border bg-background px-4 py-3 text-left text-base font-medium hover:bg-foreground/5 disabled:opacity-80 ${
+                                  reverseOutcome == null
+                                    ? "border-foreground/15"
+                                    : opt.isCorrect
+                                      ? "border-green-500 bg-green-500/5"
+                                      : reverseSelectedIndex === idx
+                                        ? "border-red-500 bg-red-500/5"
+                                        : "border-foreground/10 opacity-60"
+                                }`}
                               >
                                 <span className="mr-2 text-foreground/60">
                                   {String.fromCharCode(65 + (idx % 26))}.
