@@ -1160,6 +1160,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [showAnswer, setShowAnswer] = useState(false);
+  const [cardAppearanceToken, setCardAppearanceToken] = useState(0);
   const [reviewAnswerStyle, setReviewAnswerStyle] = useState<ReviewAnswerStyle>("normal");
   const [writePicked, setWritePicked] = useState<Array<{ index: number; ch: string }>>([]);
   const [writeOutcome, setWriteOutcome] = useState<"correct" | "wrong" | null>(null);
@@ -1179,11 +1180,11 @@ export default function Home() {
   const [nowTs, setNowTs] = useState(() => Date.now());
   const [reviewDeckConfig, setReviewDeckConfig] = useState<DeckConfig | null>(null);
 
-  // Prevent double autoplay from re-renders; reset when card changes.
-  const lastAutoPlayedCardIdRef = useRef<number | null>(null);
+  // Prevent double autoplay from re-renders; reset when the card appearance changes.
+  const lastAutoPlayedCardAppearanceTokenRef = useRef<number | null>(null);
 
   // Reverse: autoplay once when user reveals (showAnswer becomes true).
-  const lastReverseRevealAutoPlayedCardIdRef = useRef<number | null>(null);
+  const lastReverseRevealAutoPlayedCardAppearanceTokenRef = useRef<number | null>(null);
 
   // The per-card style is chosen in an effect; keep the chosen value in a ref so
   // other effects (like autoplay) can avoid running with stale style state.
@@ -3391,6 +3392,7 @@ export default function Home() {
     if (loadNextSeqRef.current !== seq) return;
     setCurrent(next);
     setShowAnswer(false);
+    if (next) setCardAppearanceToken((t) => t + 1);
 
     // Avoid heavy overview scans on every card; it can stall the UI.
     // Refresh occasionally (and always when we run out of cards).
@@ -3992,8 +3994,8 @@ export default function Home() {
     if (showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
-    if (lastAutoPlayedCardIdRef.current === currentId) return;
-    lastAutoPlayedCardIdRef.current = currentId;
+    if (lastAutoPlayedCardAppearanceTokenRef.current === cardAppearanceToken) return;
+    lastAutoPlayedCardAppearanceTokenRef.current = cardAppearanceToken;
 
     // Autoplay can be blocked by the browser; ignore failures.
     void (async () => {
@@ -4003,7 +4005,7 @@ export default function Home() {
         // ignore
       }
     })();
-  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle]);
+  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle, cardAppearanceToken]);
 
   useEffect(() => {
     if (mode !== "review") return;
@@ -4018,8 +4020,8 @@ export default function Home() {
     if (!showAnswer) return;
     const filename = promotedSound?.filename;
     if (!filename) return;
-    if (lastReverseRevealAutoPlayedCardIdRef.current === currentId) return;
-    lastReverseRevealAutoPlayedCardIdRef.current = currentId;
+    if (lastReverseRevealAutoPlayedCardAppearanceTokenRef.current === cardAppearanceToken) return;
+    lastReverseRevealAutoPlayedCardAppearanceTokenRef.current = cardAppearanceToken;
 
     // Autoplay can be blocked by the browser; ignore failures.
     void (async () => {
@@ -4029,12 +4031,12 @@ export default function Home() {
         // ignore
       }
     })();
-  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle]);
+  }, [mode, currentId, promotedSound?.filename, showAnswer, activeNamespace, reviewAnswerStyle, cardAppearanceToken]);
 
   useEffect(() => {
     if (mode !== "review") {
-      lastAutoPlayedCardIdRef.current = null;
-      lastReverseRevealAutoPlayedCardIdRef.current = null;
+      lastAutoPlayedCardAppearanceTokenRef.current = null;
+      lastReverseRevealAutoPlayedCardAppearanceTokenRef.current = null;
       chosenAnswerStyleForCardIdRef.current = null;
     }
   }, [mode]);
