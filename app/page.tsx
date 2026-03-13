@@ -4057,6 +4057,9 @@ export default function Home() {
             {authUser ? (
               <>
                 <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+                  Hola, {authUser.username}!
+                </div>
+                <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
                   Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
                 </div>
 
