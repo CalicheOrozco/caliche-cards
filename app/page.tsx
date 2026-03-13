@@ -4042,21 +4042,21 @@ export default function Home() {
   }, [mode]);
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-5 py-10">
+    <div className="caliche-shell min-h-screen bg-background text-foreground">
+      <div className="caliche-container mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-10 sm:py-12">
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
+            <h1 className="caliche-title text-3xl tracking-tight sm:text-4xl">
               Caliche Cards
             </h1>
-            <p className="text-sm text-foreground/70">
+            <p className="caliche-subtitle text-sm">
               Import an Anki .apkg and review with Fail/Pass.
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
             {authUser ? (
               <>
-                <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+                <div className="caliche-secondary-btn rounded-full px-3 py-2 text-xs text-foreground/70">
                   Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
                 </div>
 
@@ -4068,7 +4068,7 @@ export default function Home() {
 
                 <button
                   type="button"
-                  className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                  className="caliche-primary-btn rounded-full px-4 py-2 text-sm font-medium disabled:opacity-50"
                   onClick={() => void onSyncFromCloud()}
                   disabled={syncBusy || busy}
                   title={
@@ -4147,12 +4147,12 @@ export default function Home() {
               </>
             ) : authUser === null ? (
               <>
-                <div className="rounded-full border border-foreground/30 bg-foreground/5 px-3 py-2 text-xs font-semibold uppercase tracking-wide">
+                <div className="caliche-alert rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-wide">
                   Guest / Test mode
                 </div>
                 <button
                   type="button"
-                  className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                  className="caliche-primary-btn rounded-full px-4 py-2 text-sm font-medium disabled:opacity-50"
                   onClick={() => void onLoadDemoDecks()}
                   disabled={syncBusy || busy}
                   title="Load demo decks from the test account"
@@ -4161,7 +4161,7 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                  className="caliche-secondary-btn rounded-full px-4 py-2 text-sm"
                   onClick={() => {
                     window.location.href = "/login";
                   }}
@@ -4170,7 +4170,7 @@ export default function Home() {
                 </button>
               </>
             ) : (
-              <div className="rounded-full border border-foreground/15 px-3 py-2 text-xs text-foreground/70">
+              <div className="caliche-secondary-btn rounded-full px-3 py-2 text-xs text-foreground/70">
                 Checking session…
               </div>
             )}
@@ -4178,7 +4178,7 @@ export default function Home() {
             {uiLibraries.length > 0 ? (
               <button
                 type="button"
-                className="rounded-full border border-foreground/15 px-4 py-2 text-sm text-foreground/70 hover:bg-foreground/5 hover:text-foreground"
+                className="caliche-secondary-btn rounded-full px-4 py-2 text-sm text-foreground/70 hover:text-foreground"
                 onClick={onClearSaved}
               >
                 Clear all
@@ -4188,7 +4188,7 @@ export default function Home() {
         </header>
 
         {authUser === null ? (
-          <div className="rounded-2xl border border-foreground/30 bg-foreground/5 px-4 py-3 text-sm">
+          <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
             <div className="font-semibold uppercase tracking-wide">Guest / Test mode</div>
             <div className="mt-1 text-foreground/70">
               You’re viewing demo decks from a test account. Your progress stays on this device only.
@@ -4197,19 +4197,19 @@ export default function Home() {
         ) : null}
 
         {error ? (
-          <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-3 text-sm">
+          <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
             {error}
           </div>
         ) : null}
 
         {mode === "import" ? (
-          <main className="rounded-3xl border border-foreground/15 bg-background p-5">
+          <main className="caliche-panel rounded-3xl p-5 sm:p-6">
             <div className="flex flex-col gap-4">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold">Decks</div>
                 <button
                   type="button"
-                  className="rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background hover:opacity-90 disabled:opacity-50"
+                  className="caliche-primary-btn rounded-full px-4 py-2 text-sm font-medium disabled:opacity-50"
                   onClick={() => fileInputRef.current?.click()}
                   disabled={busy}
                 >
@@ -4236,7 +4236,7 @@ export default function Home() {
                   using the app offline.
                 </p>
               ) : (
-                <div className="rounded-2xl border border-foreground/15">
+                <div className="rounded-2xl border border-foreground/15 bg-surface-strong/70">
                   <div className="hidden sm:grid grid-cols-[1fr_80px_90px_110px_130px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
                     <div>Deck</div>
                     <div className="text-center">New</div>
@@ -4600,10 +4600,10 @@ export default function Home() {
         ) : null}
 
         {mode === "review" ? (
-          <main className="rounded-3xl border border-foreground/15 bg-background p-5">
+          <main className="caliche-panel rounded-3xl p-5 sm:p-6">
             <div className="flex flex-col gap-4">
               {currentMissingFields ? (
-                <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-3 text-sm">
+                <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
                   This deck was saved with an older version and is missing some
                   fields. Click <span className="font-medium">Clear all</span>{" "}
                   and re-import the <span className="font-medium">.apkg</span>.
@@ -4661,7 +4661,7 @@ export default function Home() {
               {/* Answer style is randomized per card (from enabled styles). */}
 
               {current ? (
-                <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-foreground/5 p-6">
+                <div className="relative overflow-hidden rounded-3xl border border-foreground/15 bg-surface-strong/70 p-6 shadow-[0_18px_50px_-30px_rgba(6,18,33,0.55)]">
                   {currentTimingTag ? (
                     <div className="absolute left-4 top-4 text-xs text-foreground/60">
                       <span
@@ -5002,7 +5002,7 @@ export default function Home() {
                   </div>
                 </div>
               ) : (
-                <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-6 text-center">
+                <div className="caliche-alert rounded-2xl px-4 py-6 text-center">
                   <div className="text-lg font-semibold">All done for today!</div>
                   <div className="mt-1 text-sm text-foreground/70">
                     {reviewOverview?.nextAvailableTs != null || reviewOverview?.nextDueTs != null ? (
@@ -5042,7 +5042,7 @@ export default function Home() {
                     (reviewAnswerStyle === "reverse" && reverseOutcome != null) ? (
                       <button
                         type="button"
-                        className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
+                        className="caliche-primary-btn h-12 flex-1 rounded-full px-5 text-sm font-medium"
                         onClick={() => setShowAnswer(true)}
                         disabled={reviewBusy}
                       >
@@ -5089,7 +5089,7 @@ export default function Home() {
                 ) : (
                   <button
                     type="button"
-                    className="h-12 flex-1 rounded-full bg-foreground px-5 text-sm font-medium text-background hover:opacity-90"
+                    className="caliche-primary-btn h-12 flex-1 rounded-full px-5 text-sm font-medium"
                     onClick={() => {
                       setMode("import");
                       setShowAnswer(false);

@@ -36,17 +36,17 @@ export default async function RegisterPage({
   })();
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto flex w-full max-w-md flex-col gap-6 px-5 py-10">
+    <div className="caliche-shell min-h-screen bg-background text-foreground">
+      <div className="caliche-container mx-auto flex w-full max-w-md flex-col gap-6 px-5 py-10 sm:py-14">
         <header>
-          <h1 className="text-2xl font-semibold tracking-tight">Create account</h1>
-          <p className="mt-1 text-sm text-foreground/70">
+          <h1 className="caliche-title text-3xl tracking-tight">Create account</h1>
+          <p className="caliche-subtitle mt-2 text-sm">
             Choose a username and password.
           </p>
         </header>
 
         {error ? (
-          <div className="rounded-2xl border border-foreground/15 bg-foreground/5 px-4 py-3 text-sm">
+          <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
             {error}
           </div>
         ) : null}
@@ -54,18 +54,20 @@ export default async function RegisterPage({
         <form
           method="post"
           action="/api/auth/register-form"
-          className="rounded-3xl border border-foreground/15 bg-background p-5"
+          className="caliche-panel rounded-3xl p-5 sm:p-6"
         >
           <div className="flex flex-col gap-4">
             {next ? <input type="hidden" name="next" value={next} /> : null}
 
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-foreground/70">Username</span>
+              <span className="text-xs font-semibold uppercase tracking-wide text-foreground/70">
+                Username
+              </span>
               <input
                 name="username"
                 autoComplete="username"
                 required
-                className="h-11 rounded-xl border border-foreground/15 bg-background px-4 text-sm"
+                className="caliche-input h-11 rounded-xl px-4 text-sm"
               />
               <span className="text-[11px] text-foreground/60">
                 3–32 chars. Letters, numbers, spaces, _ and -
@@ -73,20 +75,22 @@ export default async function RegisterPage({
             </label>
 
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-foreground/70">Password</span>
+              <span className="text-xs font-semibold uppercase tracking-wide text-foreground/70">
+                Password
+              </span>
               <input
                 name="password"
                 type="password"
                 autoComplete="new-password"
                 required
-                className="h-11 rounded-xl border border-foreground/15 bg-background px-4 text-sm"
+                className="caliche-input h-11 rounded-xl px-4 text-sm"
               />
               <span className="text-[11px] text-foreground/60">Minimum 8 characters</span>
             </label>
 
             <button
               type="submit"
-              className="h-11 rounded-full bg-foreground px-4 text-sm font-medium text-background hover:opacity-90"
+              className="caliche-primary-btn h-11 rounded-full px-4 text-sm font-medium"
             >
               Create account
             </button>
