@@ -41,6 +41,8 @@ import { DEFAULT_DECK_CONFIG, scheduleAnswer } from "../lib/scheduler";
 
 type Mode = "import" | "review";
 
+const LOCAL_ONLY_MODE = true;
+
 type LocalReviewLogRow = Omit<ReviewLogEntity, "syncKey"> & { syncKey?: string };
 type ReviewLogPushPayload = Omit<ReviewLogEntity, "id">;
 type ProgressPullResponse = {
@@ -194,6 +196,7 @@ async function downloadMediaBlobFromCloud(
   libraryId: string,
   name: string
 ): Promise<Blob | null> {
+  if (LOCAL_ONLY_MODE) return null;
   const safeLibraryId = String(libraryId ?? "").trim();
   const safeName = String(name ?? "").trim();
   if (!safeLibraryId || !safeName) return null;
@@ -1153,6 +1156,7 @@ export default function Home() {
       }
     | null
   >(null);
+  void syncProgress;
 
   const [libraries, setLibraries] = useState<LibraryItem[]>([]);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
@@ -1192,17 +1196,11 @@ export default function Home() {
     { cardId: number; style: ReviewAnswerStyle } | null
   >(null);
 
-  // Auto-load demo decks once when in Guest/Test mode.
-  const attemptedGuestAutoLoadRef = useRef(false);
-
   // Prevent slow/stale async updates when rapidly advancing cards.
   const loadNextSeqRef = useRef(0);
   const lastOverviewRefreshAtRef = useRef(0);
 
   // Randomize per-card answer style (50/50) when a new card is shown.
-
-  const onLoadDemoDecksRef = useRef<() => Promise<void>>(onLoadDemoDecks);
-  onLoadDemoDecksRef.current = onLoadDemoDecks;
 
   useEffect(() => {
     (async () => {
@@ -1249,35 +1247,11 @@ export default function Home() {
         if (!cancelled) setAuthUser(null);
       }
     })();
+
     return () => {
       cancelled = true;
     };
   }, []);
-
-  const isGuestMode = authUser === null;
-
-  // If the user logs in, hide any previously-loaded guest/demo libraries.
-  useEffect(() => {
-    if (!authUser) return;
-    if (libraries.length === 0) return;
-    const hasGuest = libraries.some((l) => (l as { source?: unknown }).source === "guest");
-    if (!hasGuest) return;
-
-    const nextLibraries = libraries.filter((l) => (l as { source?: unknown }).source !== "guest");
-    const nextActive = nextLibraries.some((l) => l.id === activeLibraryId)
-      ? activeLibraryId
-      : (nextLibraries[0]?.id ?? null);
-
-    setLibraries(nextLibraries);
-    setActiveLibraryId(nextActive);
-    void saveLastState({
-      libraries: nextLibraries,
-      activeLibraryId: nextActive,
-      savedAt: Date.now(),
-      lastSyncAt,
-      lastPushAtLocal,
-    });
-  }, [authUser, libraries, activeLibraryId, lastSyncAt, lastPushAtLocal]);
 
   const uiLibraries = useMemo(() => {
     if (authUser) {
@@ -1285,23 +1259,6 @@ export default function Home() {
     }
     return libraries;
   }, [authUser, libraries]);
-
-  useEffect(() => {
-    if (!isGuestMode) {
-      attemptedGuestAutoLoadRef.current = false;
-      return;
-    }
-    if (attemptedGuestAutoLoadRef.current) return;
-    if (busy || syncBusy) return;
-    const hasGuestAlready = libraries.some((l) => (l as { source?: unknown }).source === "guest");
-    if (hasGuestAlready) {
-      attemptedGuestAutoLoadRef.current = true;
-      return;
-    }
-
-    attemptedGuestAutoLoadRef.current = true;
-    void onLoadDemoDecksRef.current();
-  }, [isGuestMode, libraries, busy, syncBusy]);
 
   type DeckDataEnvelopeV1 = {
     version: 1;
@@ -2058,6 +2015,7 @@ export default function Home() {
   }
 
   async function onLoadDemoDecks() {
+    if (LOCAL_ONLY_MODE) return;
     setError(null);
     setSyncBusy(true);
     setSyncProgress({ done: 0, total: 1, phase: "Listing demo decks…" });
@@ -2190,6 +2148,10 @@ export default function Home() {
   }
 
   async function onSyncFromCloud(opts?: { silent?: boolean }) {
+    if (LOCAL_ONLY_MODE) {
+      if (!opts?.silent) setError("Cloud sync is disabled. This app now runs local-only.");
+      return;
+    }
     const silent = Boolean(opts?.silent);
     const reportError = (msg: string) => {
       if (!silent) setError(msg);
@@ -3309,31 +3271,33 @@ export default function Home() {
         return next;
       });
 
-      // Best-effort: reflect deletes in cloud.
-      try {
-        for (const id of Array.from(toDeleteIds)) {
-          const res = await fetchWithTimeout(
-            "/api/sync/progress/reset",
-            {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ libraryId, deckId: id }),
-            },
-            30_000,
-            "Cloud reset"
-          );
-          if (res.status !== 401 && !res.ok) throw new Error("Cloud reset failed");
-        }
+      if (!LOCAL_ONLY_MODE) {
+        // Best-effort: reflect deletes in cloud.
+        try {
+          for (const id of Array.from(toDeleteIds)) {
+            const res = await fetchWithTimeout(
+              "/api/sync/progress/reset",
+              {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ libraryId, deckId: id }),
+              },
+              30_000,
+              "Cloud reset"
+            );
+            if (res.status !== 401 && !res.ok) throw new Error("Cloud reset failed");
+          }
 
-        if (remainingDecks.length === 0) {
-          await deleteLibraryFromCloudNow(libraryId);
-        } else {
-          // Upload updated deck data (deck list + cards) so other devices stop seeing deleted decks.
-          await uploadLibraryDeckDataToCloudNow({ libraryId, libraryName: lib.name });
+          if (remainingDecks.length === 0) {
+            await deleteLibraryFromCloudNow(libraryId);
+          } else {
+            // Upload updated deck data (deck list + cards) so other devices stop seeing deleted decks.
+            await uploadLibraryDeckDataToCloudNow({ libraryId, libraryName: lib.name });
+          }
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Cloud update failed";
+          setError(`Deleted locally, but failed to update cloud. (${msg})`);
         }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Cloud update failed";
-        setError(`Deleted locally, but failed to update cloud. (${msg})`);
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Failed to delete deck";
@@ -4041,6 +4005,13 @@ export default function Home() {
     }
   }, [mode]);
 
+  // Local-only mode keeps cloud/admin handlers intentionally inactive.
+  void onDevPurgeOtherUsers;
+  void onDevResetMyCloud;
+  void onDevDebugCloudProgress;
+  void onLoadDemoDecks;
+  void onSyncFromCloud;
+
   return (
     <div className="caliche-shell min-h-screen bg-background text-foreground">
       <div className="caliche-container mx-auto flex w-full max-w-6xl flex-col gap-6 px-5 py-10 sm:py-12">
@@ -4057,118 +4028,39 @@ export default function Home() {
             {authUser ? (
               <>
                 <div className="caliche-secondary-btn rounded-full px-3 py-2 text-xs text-foreground/70">
-                  Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleString() : "Never"}
+                  Signed in as {authUser.username}
                 </div>
-
-                {syncBusy && syncProgress ? (
-                  <div className="max-w-55 truncate text-xs text-foreground/60" title={syncProgress.phase}>
-                    {syncProgress.phase}
-                  </div>
-                ) : null}
-
-                <button
-                  type="button"
-                  className="caliche-primary-btn rounded-full px-4 py-2 text-sm font-medium disabled:opacity-50"
-                  onClick={() => void onSyncFromCloud()}
-                  disabled={syncBusy || busy}
-                  title={
-                    syncBusy && syncProgress
-                      ? syncProgress.phase
-                      : "Download your decks from the cloud and rebuild local storage"
-                  }
-                >
-                  {(() => {
-                    if (!syncBusy) return "Sync";
-                    const total = syncProgress?.total ?? 1;
-                    const done = syncProgress?.done ?? 0;
-                    const pct = Math.max(
-                      0,
-                      Math.min(100, Math.floor((done / Math.max(1, total)) * 100))
-                    );
-                    return `Syncing… ${pct}%`;
-                  })()}
-                </button>
-
-                {devPurgeEnabled ? (
-                  <button
-                    type="button"
-                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
-                    onClick={onDevPurgeOtherUsers}
-                    disabled={busy || syncBusy}
-                    title="DEV ONLY: purge other userIds from MongoDB"
-                  >
-                    Purge other users
-                  </button>
-                ) : null}
-
-                {devPurgeEnabled ? (
-                  <button
-                    type="button"
-                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
-                    onClick={onDevResetMyCloud}
-                    disabled={busy || syncBusy}
-                    title="DEV ONLY: delete ALL cloud data for your current user"
-                  >
-                    Reset my cloud
-                  </button>
-                ) : null}
 
                 {devPurgeEnabled ? (
                   <button
                     type="button"
                     className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
                     onClick={onDevDebugLocalProgress}
-                    disabled={busy || syncBusy}
+                    disabled={busy}
                     title="DEV ONLY: show local progress counts"
                   >
                     Debug local progress
                   </button>
                 ) : null}
 
-                {devPurgeEnabled ? (
-                  <button
-                    type="button"
-                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
-                    onClick={onDevDebugCloudProgress}
-                    disabled={busy || syncBusy}
-                    title="DEV ONLY: show cloud progress counts for the current user"
-                  >
-                    Debug cloud progress
-                  </button>
-                ) : null}
-
                 <button
                   type="button"
-                  className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                  className="caliche-secondary-btn rounded-full px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
                   onClick={onLogout}
                 >
                   Logout
                 </button>
               </>
             ) : authUser === null ? (
-              <>
-                <div className="caliche-alert rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-wide">
-                  Guest / Test mode
-                </div>
-                <button
-                  type="button"
-                  className="caliche-primary-btn rounded-full px-4 py-2 text-sm font-medium disabled:opacity-50"
-                  onClick={() => void onLoadDemoDecks()}
-                  disabled={syncBusy || busy}
-                  title="Load demo decks from the test account"
-                >
-                  {syncBusy ? "Loading…" : "Load demo decks"}
-                </button>
-                <button
-                  type="button"
-                  className="caliche-secondary-btn rounded-full px-4 py-2 text-sm"
-                  onClick={() => {
-                    window.location.href = "/login";
-                  }}
-                >
-                  Log in
-                </button>
-              </>
+              <button
+                type="button"
+                className="caliche-secondary-btn rounded-full px-4 py-2 text-sm"
+                onClick={() => {
+                  window.location.href = "/login";
+                }}
+              >
+                Log in
+              </button>
             ) : (
               <div className="caliche-secondary-btn rounded-full px-3 py-2 text-xs text-foreground/70">
                 Checking session…
@@ -4187,14 +4079,9 @@ export default function Home() {
           </div>
         </header>
 
-        {authUser === null ? (
-          <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
-            <div className="font-semibold uppercase tracking-wide">Guest / Test mode</div>
-            <div className="mt-1 text-foreground/70">
-              You’re viewing demo decks from a test account. Your progress stays on this device only.
-            </div>
-          </div>
-        ) : null}
+        <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
+          Deck sync/upload to cloud is disabled. Your decks and progress are stored only on this device.
+        </div>
 
         {error ? (
           <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
