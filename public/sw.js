@@ -1,11 +1,10 @@
- 
-
 // Bump this when changing caching behavior to ensure old caches are dropped.
-const CACHE_NAME = "caliche-cards-v3";
+const CACHE_NAME = "caliche-cards-v4";
 
 const PRECACHE_URLS = [
   "/",
   "/manifest.webmanifest",
+  "/sql-wasm.wasm",
   "/favicon.ico",
   "/favicon-16x16.png",
   "/favicon-32x32.png",
@@ -52,7 +51,8 @@ self.addEventListener("fetch", (event) => {
   // Never cache API responses.
   if (url.pathname.startsWith("/api/")) return;
 
-  // Don't cache icons; browsers (Safari especially) can get stuck on old ones.
+  // Icons: try cache first, then network. Never block the app going offline
+  // just because a favicon can't be fetched.
   if (
     url.pathname === "/favicon.ico" ||
     url.pathname === "/favicon-16x16.png" ||
@@ -65,19 +65,51 @@ self.addEventListener("fetch", (event) => {
     url.pathname === "/logo-192.png" ||
     url.pathname === "/logo-512.png"
   ) {
-    event.respondWith(fetch(request));
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(CACHE_NAME);
+        const cached = await cache.match(request);
+        if (cached) return cached;
+        try {
+          const response = await fetch(request);
+          if (response && response.status === 200) {
+            cache.put(request, response.clone());
+          }
+          return response;
+        } catch {
+          return Response.error();
+        }
+      })()
+    );
     return;
   }
 
-  // For navigations, prefer network to avoid serving stale HTML across deploys.
+  // For navigations: try network with a SHORT timeout, then fall back to
+  // the cached shell. Without the timeout, Safari hangs for 30-60 s on iOS
+  // before surfacing its own "no connection" page — the SW fallback never runs.
   if (request.mode === "navigate") {
     event.respondWith(
       (async () => {
+        const cache = await caches.open(CACHE_NAME);
         try {
-          return await fetch(request);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 4000);
+          let response;
+          try {
+            response = await fetch(request, { signal: controller.signal });
+          } finally {
+            clearTimeout(timeoutId);
+          }
+          // Keep the cached shell up-to-date while online.
+          if (response && response.status === 200) {
+            cache.put(new Request("/"), response.clone());
+          }
+          return response;
         } catch {
-          const cache = await caches.open(CACHE_NAME);
-          return (await cache.match("/")) || Response.error();
+          // Network failed or timed out — serve the cached shell.
+          const cached = await cache.match("/");
+          if (cached) return cached;
+          return Response.error();
         }
       })()
     );
