@@ -58,11 +58,11 @@ export async function POST(req: NextRequest) {
   const activeLibraryIds = new Set(userLibDocs.map((l) => l.libraryId).filter(Boolean));
 
   // ── Find all deckdata GridFS files that belong to this user ───────────────
-  const userFiles = await db
-    .collection<GridFsFileDoc>("deckdata.files")
+  const userFiles = (await db
+    .collection("deckdata.files")
     .find({ "metadata.userId": userId })
     .project({ _id: 1, length: 1, uploadDate: 1, "metadata.libraryId": 1 })
-    .toArray();
+    .toArray()) as GridFsFileDoc[];
 
   // Group files by libraryId so we can keep the newest per library (legacy path).
   const byLibrary = new Map<string, GridFsFileDoc[]>();
