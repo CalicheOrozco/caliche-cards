@@ -4004,10 +4004,6 @@ export default function Home() {
     }
   }, [mode]);
 
-  // Dev-only handlers — suppressed in non-dev builds.
-  void onDevPurgeOtherUsers;
-  void onDevResetMyCloud;
-  void onDevDebugCloudProgress;
 
   return (
     <div className="caliche-shell min-h-screen bg-background text-foreground">
@@ -4029,15 +4025,44 @@ export default function Home() {
                 </div>
 
                 {devPurgeEnabled ? (
-                  <button
-                    type="button"
-                    className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
-                    onClick={onDevDebugLocalProgress}
-                    disabled={busy}
-                    title="DEV ONLY: show local progress counts"
-                  >
-                    Debug local progress
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                      onClick={onDevDebugLocalProgress}
+                      disabled={busy}
+                      title="DEV: show local progress counts"
+                    >
+                      Debug local
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-foreground/5"
+                      onClick={onDevDebugCloudProgress}
+                      disabled={busy}
+                      title="DEV: show cloud progress counts"
+                    >
+                      Debug cloud
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                      onClick={onDevResetMyCloud}
+                      disabled={busy || syncBusy}
+                      title="DEV: delete ALL my cloud data (libraries, progress, media)"
+                    >
+                      Reset my cloud
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-foreground/15 px-4 py-2 text-sm hover:bg-red-500/5 hover:border-red-500 hover:text-red-500"
+                      onClick={onDevPurgeOtherUsers}
+                      disabled={busy || syncBusy}
+                      title="DEV: delete cloud data for all OTHER users"
+                    >
+                      Purge others
+                    </button>
+                  </>
                 ) : null}
 
                 <button
