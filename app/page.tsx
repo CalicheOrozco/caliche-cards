@@ -1156,7 +1156,6 @@ export default function Home() {
       }
     | null
   >(null);
-  void syncProgress;
 
   const [libraries, setLibraries] = useState<LibraryItem[]>([]);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
@@ -4005,12 +4004,10 @@ export default function Home() {
     }
   }, [mode]);
 
-  // Local-only mode keeps cloud/admin handlers intentionally inactive.
+  // Dev-only handlers — suppressed in non-dev builds.
   void onDevPurgeOtherUsers;
   void onDevResetMyCloud;
   void onDevDebugCloudProgress;
-  void onLoadDemoDecks;
-  void onSyncFromCloud;
 
   return (
     <div className="caliche-shell min-h-screen bg-background text-foreground">
@@ -4042,6 +4039,18 @@ export default function Home() {
                     Debug local progress
                   </button>
                 ) : null}
+
+                <button
+                  type="button"
+                  className="caliche-secondary-btn rounded-full px-4 py-2 text-sm disabled:opacity-50"
+                  onClick={() => void onSyncFromCloud()}
+                  disabled={syncBusy || busy}
+                  title={syncProgress?.phase ?? "Sync decks and progress with the cloud"}
+                >
+                  {syncBusy
+                    ? (syncProgress?.phase ?? "Syncing…")
+                    : "Sync"}
+                </button>
 
                 <button
                   type="button"
@@ -4113,11 +4122,21 @@ export default function Home() {
               </div>
 
               {uiLibraries.length === 0 ? (
-                <p className="text-sm text-foreground/70">
-                  Import an <span className="font-medium">.apkg</span> to
-                  see your decks here. They are saved locally so you can keep
-                  using the app offline.
-                </p>
+                <div className="flex flex-col gap-3">
+                  <p className="text-sm text-foreground/70">
+                    Import an <span className="font-medium">.apkg</span> to
+                    see your decks here. They are saved locally so you can keep
+                    using the app offline.
+                  </p>
+                  <button
+                    type="button"
+                    className="caliche-secondary-btn self-start rounded-full px-4 py-2 text-sm disabled:opacity-50"
+                    onClick={() => void onLoadDemoDecks()}
+                    disabled={busy || syncBusy}
+                  >
+                    Load demo decks
+                  </button>
+                </div>
               ) : (
                 <div className="rounded-2xl border border-foreground/15 bg-surface-strong/70">
                   <div className="hidden sm:grid grid-cols-[1fr_80px_90px_110px_130px_48px] gap-2 border-b border-foreground/15 px-4 py-3 text-xs font-medium text-foreground/70">
