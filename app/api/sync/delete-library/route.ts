@@ -1,4 +1,4 @@
-import { GridFSBucket, type Db, type ObjectId } from "mongodb";
+import { GridFSBucket, ObjectId, type Db } from "mongodb";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { getSessionFromRequest, type JsonError } from "@/app/api/auth/_shared";
@@ -10,21 +10,29 @@ function isProbablyUuid(v: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
-function getBucket(db: Db, bucketName: "apkg" | "deckdata"): GridFSBucket {
-  return new GridFSBucket(db, { bucketName });
+function getDeckBucket(db: Db): GridFSBucket {
+  return new GridFSBucket(db, { bucketName: "deckdata" });
 }
 
 function getMediaBucket(db: Db): GridFSBucket {
   return new GridFSBucket(db, { bucketName: "media" });
 }
 
-type DeleteLibraryBody = {
+type CloudLibraryDoc = {
+  _id: ObjectId;
+  userId: string;
   libraryId: string;
+  fileId?: ObjectId;
 };
 
-type GridFsFileDoc = {
-  _id: ObjectId;
-  metadata?: { userId?: string; libraryId?: string };
+type CloudMediaDoc = {
+  userId: string;
+  libraryId: string;
+  fileId: ObjectId;
+};
+
+type DeleteLibraryBody = {
+  libraryId: string;
 };
 
 export async function POST(req: NextRequest) {
@@ -54,56 +62,91 @@ export async function POST(req: NextRequest) {
   }
 
   const userId = session.user.userId;
+  let deletedFiles = 0;
 
-  const [libsRes, cardStatesRes, reviewLogsRes, deckConfigsRes, mediaRes] = await Promise.all([
+  // ── Deck file (deckdata GridFS) ───────────────────────────────────────────
+  // Read the fileId BEFORE deleting the cloudLibraries record so we can do a
+  // reference-count check afterward.  A fileId may be shared with other users,
+  // so we only delete the GridFS file when no one else references it.
+  const libDoc = await db
+    .collection<CloudLibraryDoc>("cloudLibraries")
+    .findOne({ userId, libraryId }, { projection: { fileId: 1 } });
+
+  const [libsRes, cardStatesRes, reviewLogsRes, deckConfigsRes] = await Promise.all([
     db.collection("cloudLibraries").deleteMany({ userId, libraryId }),
     db.collection("cloudCardStates").deleteMany({ userId, libraryId }),
     db.collection("cloudReviewLogs").deleteMany({ userId, libraryId }),
     db.collection("cloudDeckConfigs").deleteMany({ userId, libraryId }),
-    db.collection("cloudMedia").deleteMany({ userId, libraryId }),
   ]);
 
-  let deletedFiles = 0;
-  for (const bucketName of ["apkg", "deckdata"] as const) {
-    const files = await db
-      .collection<GridFsFileDoc>(`${bucketName}.files`)
+  // Delete the GridFS deck file only when no cloudLibraries doc references it.
+  if (libDoc?.fileId) {
+    const refs = await db
+      .collection("cloudLibraries")
+      .countDocuments({ fileId: libDoc.fileId }, { limit: 1 });
+
+    if (refs === 0) {
+      try {
+        await getDeckBucket(db).delete(libDoc.fileId);
+        deletedFiles += 1;
+      } catch { /* ignore — file may already be gone */ }
+    }
+  } else {
+    // Legacy records have no explicit fileId — fall back to metadata-based lookup.
+    // These files are per-user (old format), so safe to delete unconditionally.
+    const legacyFiles = await db
+      .collection<{ _id: ObjectId }>("deckdata.files")
       .find({ "metadata.userId": userId, "metadata.libraryId": libraryId })
       .project({ _id: 1 })
       .toArray();
 
-    const bucket = getBucket(db, bucketName);
+    const bucket = getDeckBucket(db);
     await Promise.all(
-      files.map(async (f) => {
+      legacyFiles.map(async (f) => {
         try {
           await bucket.delete(f._id);
           deletedFiles += 1;
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       })
     );
   }
 
-  // Also delete extracted media files.
-  {
-    const files = await db
-      .collection<GridFsFileDoc>("media.files")
-      .find({ "metadata.userId": userId, "metadata.libraryId": libraryId })
-      .project({ _id: 1 })
-      .toArray();
+  // ── Media files ───────────────────────────────────────────────────────────
+  // Collect all unique fileIds BEFORE deleting the cloudMedia metadata rows.
+  // A single GridFS file may be referenced by multiple users (cross-user dedup),
+  // so we delete it from GridFS only when the last reference is gone.
+  const mediaDocs = await db
+    .collection<CloudMediaDoc>("cloudMedia")
+    .find({ userId, libraryId }, { projection: { fileId: 1 } })
+    .toArray();
 
-    const bucket = getMediaBucket(db);
-    await Promise.all(
-      files.map(async (f) => {
-        try {
-          await bucket.delete(f._id);
+  // Gather unique fileIds
+  const uniqueMediaFileIds = [
+    ...new Map(
+      mediaDocs
+        .filter((d) => d.fileId)
+        .map((d) => [String(d.fileId), d.fileId])
+    ).values(),
+  ];
+
+  const mediaRes = await db.collection("cloudMedia").deleteMany({ userId, libraryId });
+
+  // For each fileId, check if any other cloudMedia doc still references it.
+  const mediaBucket = getMediaBucket(db);
+  await Promise.all(
+    uniqueMediaFileIds.map(async (fileId) => {
+      try {
+        const refs = await db
+          .collection("cloudMedia")
+          .countDocuments({ fileId }, { limit: 1 });
+
+        if (refs === 0) {
+          await mediaBucket.delete(fileId);
           deletedFiles += 1;
-        } catch {
-          // ignore
         }
-      })
-    );
-  }
+      } catch { /* ignore */ }
+    })
+  );
 
   return NextResponse.json(
     {

@@ -41,7 +41,7 @@ import { DEFAULT_DECK_CONFIG, scheduleAnswer } from "../lib/scheduler";
 
 type Mode = "import" | "review";
 
-const LOCAL_ONLY_MODE = true;
+const LOCAL_ONLY_MODE = false;
 
 type LocalReviewLogRow = Omit<ReviewLogEntity, "syncKey"> & { syncKey?: string };
 type ReviewLogPushPayload = Omit<ReviewLogEntity, "id">;
@@ -4078,10 +4078,6 @@ export default function Home() {
             ) : null}
           </div>
         </header>
-
-        <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
-          Deck sync/upload to cloud is disabled. Your decks and progress are stored only on this device.
-        </div>
 
         {error ? (
           <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
