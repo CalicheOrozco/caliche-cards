@@ -62,10 +62,55 @@ import {
 } from "../lib/reviewPreloaders";
 import type { MatchItem } from "../lib/reviewPreloaders";
 
+
+// AURAFORGE_COIN_PATCH_V122: local persistent coin balance bridge for deck-completion rewards.
+const AURAFORGE_COIN_BALANCE_KEY = "caliche-cards:coin-balance";
+const AURAFORGE_DECK_COMPLETION_AWARDS_KEY = "caliche-cards:deck-completion-awards";
+
+type AuraForgeCoinAwardResult = {
+  awarded: boolean;
+  previousBalance: number;
+  nextBalance: number;
+};
+
+function readAuraForgeCoinBalance(): number {
+  if (typeof window === "undefined") return 0;
+  const raw = window.localStorage.getItem(AURAFORGE_COIN_BALANCE_KEY);
+  const parsed = raw ? Number.parseInt(raw, 10) : 0;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function awardAuraForgeDeckCompletionCoins(deckId: string, coins: number): AuraForgeCoinAwardResult {
+  if (typeof window === "undefined" || !deckId || coins <= 0) {
+    const current = readAuraForgeCoinBalance();
+    return { awarded: false, previousBalance: current, nextBalance: current };
+  }
+
+  const previousBalance = readAuraForgeCoinBalance();
+  const rawAwards = window.localStorage.getItem(AURAFORGE_DECK_COMPLETION_AWARDS_KEY);
+  const awards: Record<string, boolean> = rawAwards ? JSON.parse(rawAwards) : {};
+
+  if (awards[deckId]) {
+    return { awarded: false, previousBalance, nextBalance: previousBalance };
+  }
+
+  const nextBalance = previousBalance + coins;
+  awards[deckId] = true;
+  window.localStorage.setItem(AURAFORGE_DECK_COMPLETION_AWARDS_KEY, JSON.stringify(awards));
+  window.localStorage.setItem(AURAFORGE_COIN_BALANCE_KEY, String(nextBalance));
+  return { awarded: true, previousBalance, nextBalance };
+}
+
 type Mode = "import" | "review";
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("import");
+
+  const [coinBalance, setCoinBalance] = useState<number>(0);
+
+  useEffect(() => {
+    setCoinBalance(readAuraForgeCoinBalance());
+  }, []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -115,6 +160,14 @@ export default function Home() {
   const [reviewBusy, setReviewBusy] = useState(false);
   const [reviewOverview, setReviewOverview] = useState<DeckOverview | null>(null);
   const [deckOverviews, setDeckOverviews] = useState<Record<string, DeckOverview>>({});
+  const [deckCompletionMilestone, setDeckCompletionMilestone] = useState<{
+    libraryId: string;
+    deckId: number;
+    deckName: string;
+    total: number;
+    coins: number;
+    completedAt: number;
+  } | null>(null);
   const [nowTs, setNowTs] = useState(() => Date.now());
   const [reviewDeckConfig, setReviewDeckConfig] = useState<DeckConfig | null>(null);
 
@@ -755,9 +808,71 @@ export default function Home() {
     void beginReview(libraryId, deckId);
   }
 
+
+  function deckCompletionStorageKey(ref: DeckRef) {
+    return `caliche:deck-completion:${ref.libraryId}:${ref.deckId}`;
+  }
+
+  function deckCompletionRewardCoins(total: number) {
+    if (total >= 500) return 300;
+    if (total >= 100) return 150;
+    return 50;
+  }
+
+  function deckCompletionDeckName(ref: DeckRef) {
+    const lib = libraries.find((item) => item.id === ref.libraryId);
+    return lib?.deck.decks.find((deck) => deck.id === ref.deckId)?.name ?? "Deck";
+  }
+
+  async function refreshDeckCompletionMilestone(ref: DeckRef, beforeOverview: DeckOverview | null) {
+    let afterOverview: DeckOverview;
+    try {
+      afterOverview = await getDeckOverview(ref);
+    } catch {
+      return;
+    }
+
+    setReviewOverview(afterOverview);
+    setDeckOverviews((prev) => ({ ...prev, [`${ref.libraryId}:${ref.deckId}`]: afterOverview }));
+
+    const total = afterOverview.total;
+    const justCompleted = Boolean(
+      beforeOverview &&
+        beforeOverview.total > 0 &&
+        beforeOverview.reviewed < beforeOverview.total &&
+        total > 0 &&
+        afterOverview.reviewed >= total
+    );
+    if (!justCompleted) return;
+
+    const key = deckCompletionStorageKey(ref);
+    if (typeof window !== "undefined" && window.localStorage.getItem(key)) return;
+
+    const coins = deckCompletionRewardCoins(total);
+    const coinAwardResult = awardAuraForgeDeckCompletionCoins(key, coins);
+    setCoinBalance(coinAwardResult.nextBalance);
+
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        key,
+        JSON.stringify({ libraryId: ref.libraryId, deckId: ref.deckId, total, coins, completedAt: Date.now() })
+      );
+    }
+
+    setDeckCompletionMilestone({
+      libraryId: ref.libraryId,
+      deckId: ref.deckId,
+      deckName: deckCompletionDeckName(ref),
+      total,
+      coins,
+      completedAt: Date.now(),
+    });
+  }
+
   async function onAnswer(result: "fail" | "pass") {
     if (!reviewRef || !current) return;
     setReviewBusy(true);
+    const beforeCompletionOverview = await getDeckOverview(reviewRef).catch(() => null);
     try {
       if (
         reviewAnswerStyle === "match" &&
@@ -771,10 +886,12 @@ export default function Home() {
           await answerCard(reviewRef, item.cardId, cardResult);
         }
         await loadNext(reviewRef, current.card.cardId);
+        await refreshDeckCompletionMilestone(reviewRef, beforeCompletionOverview);
       } else {
         const answeredId = current.card.cardId;
         await answerCard(reviewRef, answeredId, result);
         await loadNext(reviewRef, answeredId);
+        await refreshDeckCompletionMilestone(reviewRef, beforeCompletionOverview);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Error saving answer";
@@ -1425,6 +1542,61 @@ export default function Home() {
         {error ? (
           <div className="caliche-alert rounded-2xl px-4 py-3 text-sm">
             {error}
+          </div>
+        ) : null}
+
+        {deckCompletionMilestone ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="deck-completion-title"
+          >
+            {/* AURAFORGE_CELEBRATION_PATCH_V126: full-screen celebration; motion-safe classes respect prefers-reduced-motion. */}
+            <div className="absolute inset-0 overflow-hidden" aria-hidden="true">
+              {[
+                { icon: "🎉", left: "8%", top: "16%", delay: "0ms" },
+                { icon: "✨", left: "18%", top: "72%", delay: "120ms" },
+                { icon: "🏆", left: "78%", top: "18%", delay: "240ms" },
+                { icon: "⭐", left: "88%", top: "68%", delay: "360ms" },
+                { icon: "🎊", left: "48%", top: "10%", delay: "480ms" },
+                { icon: "💫", left: "42%", top: "82%", delay: "600ms" },
+              ].map((piece) => (
+                <span
+                  key={`${piece.icon}-${piece.left}-${piece.top}`}
+                  className="absolute text-3xl motion-safe:animate-bounce sm:text-4xl"
+                  style={{ left: piece.left, top: piece.top, animationDelay: piece.delay }}
+                >
+                  {piece.icon}
+                </span>
+              ))}
+            </div>
+
+            <div className="relative w-full max-w-lg rounded-3xl border border-amber-300/70 bg-white p-6 text-center text-slate-950 shadow-2xl dark:border-amber-400/40 dark:bg-slate-950 dark:text-slate-50">
+              <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-full bg-amber-100 text-4xl dark:bg-amber-950" aria-hidden="true">
+                🏆
+              </div>
+              <div className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700 dark:text-amber-300">
+                Deck milestone reached
+              </div>
+              <h2 id="deck-completion-title" className="mt-2 text-2xl font-bold">
+                Deck completed
+              </h2>
+              <p className="mt-3 text-sm text-slate-700 dark:text-slate-200">
+                You reviewed all {deckCompletionMilestone.total} cards in “{deckCompletionMilestone.deckName}”.
+              </p>
+              <div className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-amber-950 dark:bg-amber-950/50 dark:text-amber-100" aria-live="polite">
+                <div className="text-sm font-semibold">Reward: +{deckCompletionMilestone.coins} coins</div>
+                <div className="mt-1 text-xs">Coin balance: {coinBalance.toLocaleString()}</div>
+              </div>
+              <button
+                type="button"
+                className="mt-5 rounded-full bg-amber-500 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:ring-offset-2 dark:focus:ring-offset-slate-950"
+                onClick={() => setDeckCompletionMilestone(null)}
+              >
+                Continue studying
+              </button>
+            </div>
           </div>
         ) : null}
 
