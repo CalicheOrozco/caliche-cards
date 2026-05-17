@@ -148,6 +148,7 @@ export function DeckList({
                   const depth = Math.max(0, d.name.split("::").length - 1);
                   const display = d.name.split("::").slice(-1)[0] ?? d.name;
                   const overview = deckOverviews[`${lib.id}:${d.id}`] ?? null;
+                  const deckCompleted = Boolean(overview && overview.total > 0 && overview.reviewed >= overview.total);
                   const isSelected =
                     activeLibraryId === lib.id &&
                     (lib.selectedDeckId ?? null) === d.id;
@@ -202,7 +203,18 @@ export function DeckList({
                               autoFocus
                             />
                           ) : (
-                            display
+                            <span className="inline-flex items-center gap-2">
+                              <span>{display}</span>
+                              {deckCompleted ? (
+                                <span
+                                  className="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-950 dark:text-amber-200"
+                                  title="Deck completed"
+                                  aria-label="Deck completed"
+                                >
+                                  🏆
+                                </span>
+                              ) : null}
+                            </span>
                           )}
                         </div>
                       </button>
